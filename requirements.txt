@@ -1,0 +1,25 @@
+# Audio2Video — Free & Open resources only
+# Core scientific / audio analysis
+numpy<2.0
+scipy
+librosa==0.10.2.post1
+soundfile
+
+# Video assembly
+moviepy==1.0.3
+imageio
+imageio-ffmpeg
+Pillow
+
+# Speech-to-text (optional, runs fully offline/local, free & open source)
+faster-whisper
+
+# HTTP client for free stock media APIs (Pexels, Pixabay, Freesound)
+requests
+
+# Desktop GUI
+PySide6
+
+# Misc utilities
+python-dotenv
+tqdm

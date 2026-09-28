@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# App runtime data (settings, downloaded media cache, generated output)
+cache/*
+!cache/.gitkeep
+output/*
+!output/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
