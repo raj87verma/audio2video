@@ -22,13 +22,48 @@ non-Python data (onnxruntime capi, ctranslate2 shared libs, imageio-ffmpeg's
 bundled ffmpeg binary) or use dynamic/lazy imports PyInstaller's static
 analysis can't see (faster_whisper, tokenizers, PySide6 plugins).
 """
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, copy_metadata
 
 block_cipher = None
 
 datas = []
 binaries = []
 hiddenimports = []
+
+# --- Package metadata (dist-info) --------------------------------------
+# Several dependencies (imageio, huggingface_hub, tokenizers, numba,
+# librosa's own transitive deps like pooch/lazy_loader/decorator, etc.)
+# call importlib.metadata.version(...) at import time to check their own
+# or a related package's version. `collect_all()` below gathers each
+# package's *data files and code*, but NOT its installed-distribution
+# metadata (the .dist-info directory) -- that requires copy_metadata()
+# specifically. Without it, the frozen exe crashes with
+# `importlib.metadata.PackageNotFoundError` the first time any bundled
+# library does a version lookup.
+#
+# Rather than hand-picking which of ~60 installed packages need this (new
+# transitive dependencies could reintroduce the same crash later), copy
+# metadata for every distribution actually installed in this build
+# environment. This is cheap (a few KB of text per package) and
+# eliminates the whole class of "No package metadata was found for X"
+# errors, not just the one already seen for `imageio`.
+try:
+    from importlib.metadata import distributions as _distributions
+except ImportError:  # pragma: no cover - Python <3.8 fallback, unused here
+    _distributions = None
+
+if _distributions is not None:
+    for _dist in _distributions():
+        _name = _dist.metadata.get("Name") if _dist.metadata else None
+        if not _name:
+            continue
+        try:
+            datas += copy_metadata(_name)
+        except Exception:
+            # A handful of internal/namespace packages have no proper
+            # dist-info copy_metadata can read; skip those rather than
+            # aborting the whole build.
+            pass
 
 # --- Packages that need their non-Python payload (native libs / data
 # files / plugins) collected explicitly, since PyInstaller's default
