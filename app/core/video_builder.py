@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +43,21 @@ log = logging.getLogger(__name__)
 CROSSFADE_DURATION = 0.35  # seconds, overlap between consecutive shots
 SFX_VOLUME = 0.45          # relative volume of the generated SFX layer vs. original audio
 KEN_BURNS_ZOOM = 0.16       # fraction of extra zoom range for the Ken Burns effect
+
+# How many shots are ever "live" in MoviePy/FFmpeg/PIL memory at once while
+# assembling. Each shot can hold an open PIL image (still-image Ken Burns
+# shots) or, more importantly, an open FFmpeg subprocess pipe (stock-video
+# shots, via VideoFileClip). Long audio tracks can plan hundreds of shots
+# (e.g. a ~6 minute track easily produces 150-250 shots at typical
+# tempos) -- building every single one of those simultaneously and only
+# then handing them all to a single concatenate_videoclips() call was
+# exhausting memory / OS file-handle limits on real machines (observed:
+# an unrecoverable crash partway through building shot clips on a ~200+
+# shot track). Rendering in small batches -- each batch fully written to
+# a temporary intermediate file and its resources released before the
+# next batch starts -- keeps peak resource usage bounded no matter how
+# long the source audio is.
+SHOT_BATCH_SIZE = 20
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +332,43 @@ def build_sfx_track(shots: list[Shot], total_duration: float, sr: int = 44100) -
 # Full assembly
 # ---------------------------------------------------------------------------
 
+def _build_clip_batch(
+    shots_batch: list[Shot],
+    resolved_media: dict[int, tuple[str | None, str]],
+    mood: MoodProfile,
+    target_w: int,
+    target_h: int,
+    fps: int,
+    energy_fn,
+) -> VideoClip:
+    """Build and concatenate (with crossfades) just one batch of shots into
+    a single silent video clip. The caller is responsible for closing the
+    returned clip once it's done with it (or, in practice here, once it's
+    been written out to a temporary file and immediately discarded).
+    """
+    clips = []
+    try:
+        for shot in shots_batch:
+            local_path, kind = resolved_media.get(shot.index, (None, "procedural"))
+            clips.append(
+                build_shot_clip(shot, local_path, kind, mood, target_w, target_h, fps, energy_fn=energy_fn)
+            )
+
+        if len(clips) > 1:
+            faded = [clips[0]] + [c.crossfadein(CROSSFADE_DURATION) for c in clips[1:]]
+            batch_video = concatenate_videoclips(faded, method="compose", padding=-CROSSFADE_DURATION)
+        else:
+            batch_video = clips[0]
+        return batch_video
+    except Exception:
+        for c in clips:
+            try:
+                c.close()
+            except Exception:
+                pass
+        raise
+
+
 def assemble_video(
     shots: list[Shot],
     resolved_media: dict[int, tuple[str | None, str]],
@@ -333,61 +387,119 @@ def assemble_video(
     `energy_fn(t) -> float 0..1` optionally drives procedural-clip
     brightness/particle intensity from the real audio energy envelope.
     `progress_cb(fraction, message)` optionally reports progress (0..1).
+
+    Shots are assembled in bounded-size batches (see `SHOT_BATCH_SIZE`)
+    rather than all at once: each batch is fully rendered to a small
+    temporary silent-video file and its in-memory MoviePy/PIL/FFmpeg
+    resources are released before the next batch starts, and only the
+    lightweight temporary *files* are kept around (concatenated at the
+    very end). This keeps peak memory/file-handle usage roughly constant
+    regardless of how many shots a long track produces, instead of
+    scaling with the total shot count.
     """
     target_w, target_h = target_size
+    total_shots = len(shots)
 
     def report(frac, msg):
         log.info("[%.0f%%] %s", frac * 100, msg)
         if progress_cb:
             progress_cb(frac, msg)
 
-    report(0.0, "Building shot clips...")
-    clips = []
-    for i, shot in enumerate(shots):
-        local_path, kind = resolved_media.get(shot.index, (None, "procedural"))
-        clip = build_shot_clip(shot, local_path, kind, mood, target_w, target_h, fps, energy_fn=energy_fn)
-        clips.append(clip)
-        report(0.05 + 0.45 * (i + 1) / max(1, len(clips)), f"Built shot {i + 1}/{len(shots)}")
+    if total_shots == 0:
+        raise ValueError("No shots were planned for this audio file; nothing to render.")
 
-    report(0.5, "Applying transitions...")
-    if len(clips) > 1:
-        faded = [clips[0]] + [c.crossfadein(CROSSFADE_DURATION) for c in clips[1:]]
-        video = concatenate_videoclips(faded, method="compose", padding=-CROSSFADE_DURATION)
-    else:
-        video = clips[0]
+    tmp_dir = Path(tempfile.mkdtemp(prefix="audio2video_batches_"))
+    batch_paths: list[Path] = []
 
-    report(0.6, "Building SFX layer...")
-    sfx_track = build_sfx_track(shots, video.duration, sr=44100)
-    sfx_stereo = np.stack([sfx_track, sfx_track], axis=1)
-    sfx_audio = AudioArrayClip(sfx_stereo, fps=44100).volumex(SFX_VOLUME)
+    try:
+        report(0.0, f"Building shot clips (0/{total_shots})...")
+        num_batches = math.ceil(total_shots / SHOT_BATCH_SIZE)
 
-    report(0.7, "Mixing audio...")
-    original_audio = AudioFileClip(audio_path)
-    # Match audio length to the (possibly slightly shorter, due to crossfade
-    # padding) final video duration so mux doesn't leave a silent/black tail.
-    final_duration = min(video.duration, original_audio.duration)
-    original_audio = original_audio.subclip(0, final_duration)
-    sfx_audio = sfx_audio.subclip(0, min(final_duration, sfx_audio.duration))
-    final_audio = CompositeAudioClip([original_audio, sfx_audio])
+        for batch_idx in range(num_batches):
+            start_i = batch_idx * SHOT_BATCH_SIZE
+            end_i = min(start_i + SHOT_BATCH_SIZE, total_shots)
+            shots_batch = shots[start_i:end_i]
 
-    video = video.subclip(0, final_duration).set_audio(final_audio)
+            report(
+                0.05 + 0.45 * (start_i / total_shots),
+                f"Building shots {start_i + 1}-{end_i}/{total_shots}...",
+            )
 
-    report(0.8, "Encoding final video (this may take a while)...")
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    video.write_videofile(
-        output_path,
-        fps=fps,
-        codec="libx264",
-        audio_codec="aac",
-        preset="medium",
-        threads=4,
-        logger=None,
-    )
-    report(1.0, "Done.")
+            batch_video = _build_clip_batch(
+                shots_batch, resolved_media, mood, target_w, target_h, fps, energy_fn
+            )
+            try:
+                batch_path = tmp_dir / f"batch_{batch_idx:04d}.mp4"
+                # No audio yet -- silent intermediate files, muxed with the
+                # real audio + SFX only once at the very end. A lower encode
+                # preset is fine here since these are throwaway intermediates.
+                batch_video.write_videofile(
+                    str(batch_path),
+                    fps=fps,
+                    codec="libx264",
+                    audio=False,
+                    preset="ultrafast",
+                    threads=2,
+                    logger=None,
+                )
+                batch_paths.append(batch_path)
+            finally:
+                batch_video.close()
 
-    for c in clips:
-        c.close()
-    original_audio.close()
-    video.close()
+            report(
+                0.05 + 0.45 * (end_i / total_shots),
+                f"Built shots {start_i + 1}-{end_i}/{total_shots}",
+            )
 
-    return output_path
+        report(0.5, "Joining batches...")
+        batch_clips = [VideoFileClip(str(p), audio=False) for p in batch_paths]
+        try:
+            if len(batch_clips) > 1:
+                # Batches were already crossfaded *within* themselves; a
+                # straight concatenation (no re-crossfade) between batches
+                # avoids double-dipping into the same shot boundary twice.
+                video = concatenate_videoclips(batch_clips, method="compose")
+            else:
+                video = batch_clips[0]
+
+            report(0.6, "Building SFX layer...")
+            sfx_track = build_sfx_track(shots, video.duration, sr=44100)
+            sfx_stereo = np.stack([sfx_track, sfx_track], axis=1)
+            sfx_audio = AudioArrayClip(sfx_stereo, fps=44100).volumex(SFX_VOLUME)
+
+            report(0.7, "Mixing audio...")
+            original_audio = AudioFileClip(audio_path)
+            try:
+                # Match audio length to the (possibly slightly shorter, due
+                # to crossfade padding) final video duration so mux doesn't
+                # leave a silent/black tail.
+                final_duration = min(video.duration, original_audio.duration)
+                trimmed_original_audio = original_audio.subclip(0, final_duration)
+                trimmed_sfx_audio = sfx_audio.subclip(0, min(final_duration, sfx_audio.duration))
+                final_audio = CompositeAudioClip([trimmed_original_audio, trimmed_sfx_audio])
+
+                final_video = video.subclip(0, final_duration).set_audio(final_audio)
+
+                report(0.8, "Encoding final video (this may take a while)...")
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                final_video.write_videofile(
+                    output_path,
+                    fps=fps,
+                    codec="libx264",
+                    audio_codec="aac",
+                    preset="medium",
+                    threads=4,
+                    logger=None,
+                )
+                final_video.close()
+            finally:
+                original_audio.close()
+        finally:
+            for c in batch_clips:
+                c.close()
+
+        report(1.0, "Done.")
+        return output_path
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
