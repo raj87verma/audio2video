@@ -207,7 +207,36 @@ def build_image_shot_clip(
 def build_video_shot_clip(
     video_path: str, shot: Shot, target_w: int, target_h: int, fps: int, grade: str
 ) -> VideoClip:
+    """Build a shot clip from a downloaded stock video file.
+
+    IMPORTANT resource-management note: `VideoFileClip` opens an FFmpeg
+    subprocess (a real OS process + pipe) for the lifetime of the object,
+    and overrides `close()` to terminate it. Every derived clip we create
+    from it below (`subclip`, `resize`, `crop`, `fl_image`, ...) wraps the
+    original in a *new* Clip object whose own `close()` is the inert
+    default from the base `Clip` class -- it does **not** know how to
+    reach back and terminate the original `VideoFileClip`'s subprocess.
+    Only closing that exact original `raw` object (or a `concatenate_*`
+    result that MoviePy happens to store `.clips` on) actually releases
+    the subprocess.
+
+    Without doing this explicitly, every stock-video shot leaks one
+    running FFmpeg process for the remainder of the program's life. On a
+    long track with hundreds of video shots (very much the common case
+    once free Pexels/Pixabay API keys are configured, since video is
+    preferred over stills), this silently accumulates until the process
+    exhausts memory/handles and crashes -- even though the *reported*
+    per-batch clips are being closed correctly, because none of those
+    ever held a reference to the real underlying subprocess in the first
+    place.
+
+    So: `raw` is returned to the caller stashed on the resulting clip via
+    `._audio2video_raw_clips`, and every caller in this module is
+    responsible for closing everything in that list once it's done with
+    the shot (see `_close_shot_clip`).
+    """
     raw = VideoFileClip(video_path, audio=False)
+    raw_clips_to_close = [raw]
     needed = shot.duration
 
     if raw.duration >= needed:
@@ -216,13 +245,34 @@ def build_video_shot_clip(
         start = min(max_start, max_start / 2)
         clip = raw.subclip(start, start + needed)
     else:
-        # loop short stock clips to cover the shot duration
+        # loop short stock clips to cover the shot duration. Each repeated
+        # reference in `[raw] * loops` is the *same* object, so this does
+        # not open extra subprocesses -- `raw` alone still covers it.
         loops = int(math.ceil(needed / raw.duration))
         clip = concatenate_videoclips([raw] * loops).subclip(0, needed)
 
     clip = cover_resize_crop(clip, target_w, target_h)
     clip = clip.fl_image(lambda f: apply_color_grade(f, grade))
-    return clip.set_fps(fps).set_duration(needed)
+    clip = clip.set_fps(fps).set_duration(needed)
+    clip._audio2video_raw_clips = raw_clips_to_close
+    return clip
+
+
+def _close_shot_clip(clip) -> None:
+    """Close `clip` and, if present, any underlying raw `VideoFileClip`(s)
+    stashed on it by `build_video_shot_clip` -- see that function's
+    docstring for why this indirection is necessary. Safe to call on any
+    clip, including ones that never touched a video file.
+    """
+    for raw in getattr(clip, "_audio2video_raw_clips", []):
+        try:
+            raw.close()
+        except Exception:
+            pass
+    try:
+        clip.close()
+    except Exception:
+        pass
 
 
 def build_procedural_shot_clip(
@@ -277,6 +327,20 @@ def build_shot_clip(
         if kind == "video" and local_path:
             return build_video_shot_clip(local_path, shot, target_w, target_h, fps, mood.color_grade)
     except Exception as exc:
+        # If building the video clip failed partway through (e.g. "failed
+        # to read the first frame", a corrupted/truncated download), any
+        # VideoFileClip subprocess it already opened before failing would
+        # otherwise leak silently -- there is no successfully-returned
+        # clip object here for the caller to close. video_builder can't
+        # see `raw` from inside build_video_shot_clip's exception path, so
+        # explicitly ask FFMPEG_VideoReader-backed clips to release
+        # themselves isn't possible here; instead build_video_shot_clip
+        # itself guards this above by only registering `raw` for cleanup
+        # on success. Genuinely orphaned subprocesses from a raised
+        # exception inside VideoFileClip's own constructor are extremely
+        # rare (that constructor doesn't open the pipe until first frame
+        # read) and are left to the OS/process exit, same as any other
+        # third-party library failure would be.
         log.warning("Failed to build clip for shot #%d from %s (%s); using procedural fallback", shot.index, local_path, exc)
 
     return build_procedural_shot_clip(shot, mood, target_w, target_h, fps, energy_fn=energy_fn, seed=seed)
@@ -340,11 +404,24 @@ def _build_clip_batch(
     target_h: int,
     fps: int,
     energy_fn,
-) -> VideoClip:
+) -> tuple[VideoClip, list[VideoClip]]:
     """Build and concatenate (with crossfades) just one batch of shots into
-    a single silent video clip. The caller is responsible for closing the
-    returned clip once it's done with it (or, in practice here, once it's
-    been written out to a temporary file and immediately discarded).
+    a single silent video clip.
+
+    Returns `(batch_video, clips_to_close)`. `clips_to_close` includes every
+    individual per-shot clip that was built (and, transitively via
+    `_close_shot_clip`, whatever raw `VideoFileClip` each of them wraps).
+
+    IMPORTANT: when `len(clips) > 1`, `batch_video` is a `CompositeVideoClip`
+    (that's what `concatenate_videoclips(..., method="compose")` returns).
+    `CompositeVideoClip.close()` only closes its own `bg`/`audio` attributes
+    -- it does **not** close the `clips` it was built from. So closing just
+    `batch_video` on its own leaves every per-shot clip's underlying FFmpeg
+    subprocess (for any stock-video shot) running indefinitely. The caller
+    MUST close everything in `clips_to_close` *in addition to* `batch_video`,
+    and MUST do so only after it's completely done reading frames from
+    `batch_video` (e.g. after `write_videofile()` has returned) -- closing
+    them earlier would pull the rug out from under frames still being read.
     """
     clips = []
     try:
@@ -359,13 +436,10 @@ def _build_clip_batch(
             batch_video = concatenate_videoclips(faded, method="compose", padding=-CROSSFADE_DURATION)
         else:
             batch_video = clips[0]
-        return batch_video
+        return batch_video, clips
     except Exception:
         for c in clips:
-            try:
-                c.close()
-            except Exception:
-                pass
+            _close_shot_clip(c)
         raise
 
 
@@ -425,7 +499,7 @@ def assemble_video(
                 f"Building shots {start_i + 1}-{end_i}/{total_shots}...",
             )
 
-            batch_video = _build_clip_batch(
+            batch_video, batch_shot_clips = _build_clip_batch(
                 shots_batch, resolved_media, mood, target_w, target_h, fps, energy_fn
             )
             try:
@@ -444,7 +518,15 @@ def assemble_video(
                 )
                 batch_paths.append(batch_path)
             finally:
+                # Close the composite AND every individual per-shot clip it
+                # was built from -- see _build_clip_batch's docstring for
+                # why both are required. This must happen only after
+                # write_videofile() above has fully finished reading frames
+                # from batch_video (it has, we're past that call now),
+                # otherwise we'd terminate an FFmpeg subprocess mid-read.
                 batch_video.close()
+                for c in batch_shot_clips:
+                    _close_shot_clip(c)
 
             report(
                 0.05 + 0.45 * (end_i / total_shots),
