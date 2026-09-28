@@ -53,7 +53,68 @@ real stock footage/photos and, optionally, real recorded sound effects.
 
 ---
 
-## 1. Setup
+## Windows Installer (easiest way to get started)
+
+If you're on Windows and don't want to set up Python yourself, download the
+ready-made installer instead of following the manual setup below:
+
+1. Go to the [Releases page](https://github.com/raj87verma/audio2video/releases)
+   and download the latest `Audio2Video-Setup.exe`.
+   - No release yet, or want the newest in-progress build? Go to
+     [Actions → Build Windows Installer](https://github.com/raj87verma/audio2video/actions/workflows/build-windows-installer.yml),
+     open the most recent successful run, and download the
+     `Audio2Video-Setup-*` artifact from the bottom of the run's summary
+     page (artifacts require being logged into GitHub; they expire after
+     30 days — a tagged release is permanent).
+2. Run `Audio2Video-Setup.exe`. It does **not** require Administrator
+   rights and installs by default under your own user profile
+   (`%LOCALAPPDATA%\Programs\Audio2Video`) — you can change the install
+   folder to any drive/path in the setup wizard.
+3. Launch **Audio2Video** from the Start Menu (or the optional desktop
+   shortcut). Everything — Python, FFmpeg, and every dependency — is
+   already bundled inside; nothing else to install.
+4. (Optional) Add free Pexels/Pixabay/Freesound API keys in the app's
+   **Settings** tab — see [section 2](#2-getting-free-api-keys-all-optional)
+   below.
+
+The installer is built automatically by
+[`.github/workflows/build-windows-installer.yml`](.github/workflows/build-windows-installer.yml)
+using PyInstaller (freezes the app + all Python dependencies) and
+[Inno Setup](https://jrsoftware.org/isinfo.php) (wraps that into a
+single-file `Setup.exe` with Start Menu/Desktop shortcuts and a proper
+uninstaller). To trigger a fresh build yourself: go to
+**Actions → Build Windows Installer → Run workflow**.
+
+> **Note:** the installer is not code-signed (that requires a paid code
+> signing certificate). Windows SmartScreen may show an "unrecognized app"
+> warning the first time you run it — click **More info → Run anyway** to
+> proceed. This is expected for any unsigned installer, not a sign that
+> something is wrong.
+
+### Building the installer locally (advanced / maintainers)
+
+You need a real Windows machine for this (PyInstaller cannot cross-compile
+a Windows `.exe` from Linux/macOS):
+
+```powershell
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+pip install pyinstaller
+pyinstaller packaging\audio2video.spec --noconfirm
+```
+
+Then install [Inno Setup](https://jrsoftware.org/isdl.php), and run:
+
+```powershell
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.0 packaging\installer.iss
+```
+
+The finished installer is written to `dist\installer\Audio2Video-Setup.exe`.
+
+---
+
+## 1. Setup (from source, any OS)
 
 ### Requirements
 - Python 3.10+ (a virtual environment is strongly recommended)
@@ -177,8 +238,9 @@ checkpoint (in-progress downloads/renders are not partially corrupted).
 
 ```
 audio2video/
+├── run.py                   PyInstaller / standalone entry point (python run.py)
 ├── app/
-│   ├── main.py              entry point (python -m app.main)
+│   ├── main.py              GUI entry point (python -m app.main)
 │   ├── config.py            Settings dataclass, cache/output paths
 │   ├── core/
 │   │   ├── audio_analysis.py    tempo/beats/energy/spectral features (librosa)
@@ -193,6 +255,12 @@ audio2video/
 │   └── gui/
 │       ├── main_window.py       Create Video / Settings / About tabs
 │       └── worker.py            background QThread pipeline runner
+├── packaging/
+│   ├── app_icon.ico          app/installer icon
+│   ├── audio2video.spec      PyInstaller build spec
+│   └── installer.iss         Inno Setup script (builds Setup.exe)
+├── .github/workflows/
+│   └── build-windows-installer.yml  CI: builds Setup.exe on windows-latest
 └── requirements.txt
 ```
 
