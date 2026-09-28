@@ -1,0 +1,110 @@
+name: Build Windows Installer
+
+# Builds a Windows Setup.exe for Audio2Video using PyInstaller (freeze the
+# app + all deps into a onedir bundle) followed by Inno Setup (wrap that
+# bundle into a single-file installer with Start Menu/Desktop shortcuts and
+# an uninstaller). Runs on a real windows-latest GitHub-hosted runner since
+# a Windows .exe cannot be cross-compiled from Linux/macOS.
+#
+# Triggers:
+#   - workflow_dispatch: manual run from the Actions tab (or `gh` CLI) —
+#     always uploads the installer as a build artifact you can download
+#     straight from the run page.
+#   - push of a `v*` tag (e.g. v0.1.0): same build, plus the resulting
+#     Setup.exe is attached to a GitHub Release for that tag so users get
+#     a stable, permanent download link instead of a temporary artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string to embed in the installer (e.g. 0.1.0). Defaults to a dev build number if left blank."
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to attach the installer to a GitHub Release on tag builds
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Determine version string
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="0.0.0-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved installer version: ${VERSION}"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build frozen app with PyInstaller
+        run: |
+          pyinstaller packaging/audio2video.spec --noconfirm
+
+      - name: Sanity-check PyInstaller output
+        shell: bash
+        run: |
+          if [ ! -f "dist/audio2video/Audio2Video.exe" ]; then
+            echo "::error::PyInstaller did not produce dist/audio2video/Audio2Video.exe"
+            find dist -maxdepth 3 || true
+            exit 1
+          fi
+          echo "PyInstaller output looks correct:"
+          ls -la dist/audio2video/ | head -20
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer with Inno Setup
+        shell: cmd
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.version }} packaging\installer.iss
+
+      - name: Sanity-check installer output
+        shell: bash
+        run: |
+          if [ ! -f "dist/installer/Audio2Video-Setup.exe" ]; then
+            echo "::error::Inno Setup did not produce dist/installer/Audio2Video-Setup.exe"
+            find dist -maxdepth 3 || true
+            exit 1
+          fi
+          echo "Installer built successfully:"
+          ls -la dist/installer/
+
+      - name: Upload installer as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audio2Video-Setup-${{ steps.version.outputs.version }}
+          path: dist/installer/Audio2Video-Setup.exe
+          retention-days: 30
+
+      - name: Attach installer to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/Audio2Video-Setup.exe
+          name: "Audio2Video ${{ github.ref_name }}"
+          generate_release_notes: true
