@@ -165,6 +165,18 @@ class CreateVideoTab(QWidget):
             f"stock_media={result.used_stock_media_count}, procedural={result.used_procedural_count}, "
             f"render_time={result.render_seconds:.1f}s"
         )
+        # Wikimedia Commons media (unlike Pexels/Pixabay) generally requires
+        # crediting the original author under its CC license -- surface that
+        # clearly rather than leaving it buried only in the credits .txt file
+        # on disk, since it's a real compliance requirement for whoever
+        # publishes this video, not just an FYI.
+        if result.wikimedia_assets_used:
+            self.log_view.appendPlainText(
+                f"\nThis video uses {len(result.wikimedia_assets_used)} media item(s) from "
+                "Wikimedia Commons, which require crediting the original author. "
+                f"A credits file was saved to:\n{result.credits_file_path}\n"
+                "Please include this credit text in the video's description when you publish it."
+            )
         self._reset_buttons(finished=True)
 
     def _on_finished_error(self, message: str) -> None:
@@ -240,6 +252,27 @@ class SettingsTab(QWidget):
         speech_group.setLayout(sform)
         layout.addWidget(speech_group)
 
+        wikimedia_group = QGroupBox("Wikimedia Commons (deity-specific footage — no sign-up needed)")
+        wform = QFormLayout()
+        self.use_wikimedia_check = QCheckBox(
+            "Use Wikimedia Commons for named deities/temples (e.g. Khatu Shyam, Hanuman)"
+        )
+        wform.addRow(self.use_wikimedia_check)
+        wikimedia_note = QLabel(
+            "When a devotional song's filename or lyrics name a specific deity, the app\n"
+            "checks Wikimedia Commons first for real matching photos/footage — something\n"
+            "Pexels/Pixabay don't have. Only used for that narrow case; everything else\n"
+            "still uses Pexels/Pixabay/generated visuals as usual.\n"
+            "Note: unlike Pexels/Pixabay, Wikimedia media requires crediting the original\n"
+            "author (Creative Commons license). When used, the app automatically writes a\n"
+            "'<video>_credits.txt' file next to the output — include that text in the\n"
+            "video's description when you publish it."
+        )
+        wikimedia_note.setWordWrap(True)
+        wform.addRow(wikimedia_note)
+        wikimedia_group.setLayout(wform)
+        layout.addWidget(wikimedia_group)
+
         save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self._save)
         layout.addWidget(save_btn)
@@ -255,6 +288,7 @@ class SettingsTab(QWidget):
         self.prefer_video_check.setChecked(s.prefer_video_clips)
         self.use_stt_check.setChecked(s.use_speech_to_text)
         self.whisper_combo.setCurrentText(s.whisper_model_size)
+        self.use_wikimedia_check.setChecked(s.use_wikimedia)
 
     def _save(self) -> None:
         s = self.settings
@@ -266,6 +300,7 @@ class SettingsTab(QWidget):
         s.prefer_video_clips = self.prefer_video_check.isChecked()
         s.use_speech_to_text = self.use_stt_check.isChecked()
         s.whisper_model_size = self.whisper_combo.currentText()
+        s.use_wikimedia = self.use_wikimedia_check.isChecked()
         s.save()
         self._on_save(s)
         QMessageBox.information(self, "Settings saved", "Your settings have been saved.")
@@ -280,6 +315,10 @@ ABOUT_HTML = """
   <li><b>Lyrics/speech detection</b> — faster-whisper, runs fully offline</li>
   <li><b>Stock visuals</b> — <a href="https://www.pexels.com/api/">Pexels</a> and
       <a href="https://pixabay.com/api/docs/">Pixabay</a> free APIs (free sign-up, no credit card)</li>
+  <li><b>Deity-specific visuals</b> — <a href="https://commons.wikimedia.org/">Wikimedia Commons</a>
+      (no sign-up/API key needed at all). Used automatically when a devotional song's filename
+      or lyrics name a specific deity or temple (e.g. Khatu Shyam, Hanuman) — Pexels/Pixabay have
+      no coverage of these, but Wikimedia has real devotee-submitted photos and video</li>
   <li><b>Procedural fallback visuals</b> — generated locally, used automatically whenever
       no API key is configured or no stock result matches</li>
   <li><b>Sound effects</b> — synthetic (numpy-generated) by default, optionally
@@ -300,7 +339,14 @@ ABOUT_HTML = """
 of them — it just relies more on generated visuals and synthetic sound effects.</p>
 <p><b>License note:</b> Pexels and Pixabay content is free to use per their own
 license terms; always check the current license text on their sites before
-redistributing generated videos commercially.</p>
+redistributing generated videos commercially. <b>Wikimedia Commons media is
+different</b> — it's almost always published under a Creative Commons license
+(typically CC BY or CC BY-SA) that <b>requires crediting the original author</b>.
+Whenever a render uses any Wikimedia media, the app automatically writes a
+<code>&lt;video-name&gt;_credits.txt</code> file next to the output listing every
+item's title, author and license link — include that text in the video's
+description (YouTube, Instagram, etc.) when you publish it. You can turn
+Wikimedia off entirely in the Settings tab if you'd rather skip this.</p>
 """
 
 

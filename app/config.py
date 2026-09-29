@@ -41,6 +41,16 @@ class Settings:
     target_resolution: str = "1080p"  # 720p / 1080p / 4k
     fps: int = 30
     prefer_video_clips: bool = True  # prefer stock video over still images when available
+    # Wikimedia Commons needs no API key/sign-up (unlike Pexels/Pixabay)
+    # and is only ever consulted for a *specific* detected deity/entity
+    # (see content_hints.py) -- generic devotional/mood keywords still go
+    # to Pexels/Pixabay as usual. Defaults on since it requires no setup
+    # and only activates for a narrow, deliberately-targeted query type;
+    # can be turned off for users who'd rather skip an extra network
+    # source or who have attribution concerns (Wikimedia media is
+    # typically CC BY-SA, which requires crediting the author -- see the
+    # auto-generated credits file this produces).
+    use_wikimedia: bool = True
     extra: dict = field(default_factory=dict)
 
     @classmethod
