@@ -80,6 +80,7 @@ for pkg in (
     "PySide6",
     "soundfile",
     "PIL",
+    "cv2",
 ):
     try:
         pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(pkg)
