@@ -19,18 +19,22 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from ..config import OUTPUT_DIR, Settings
 from .audio_analysis import AudioFeatures, analyze_audio
 from .content_hints import detect_content_hints
+from .credits import write_credits_file
 from .media_fetcher import download_asset, search_media
 from .mood import MoodProfile, classify_mood
 from .shot_planner import Shot, plan_shots
 from .transcribe import TranscriptResult, transcribe_audio
 from .video_builder import assemble_video
+from .wikimedia_fetcher import WikimediaAsset
+from .wikimedia_fetcher import download_asset as download_wikimedia_asset
+from .wikimedia_fetcher import search_wikimedia
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +51,16 @@ class PipelineResult:
     render_seconds: float
     used_stock_media_count: int = 0
     used_procedural_count: int = 0
+    # Wikimedia Commons assets actually used in the render, if any --
+    # these carry a CC-BY-SA-style attribution requirement that
+    # Pexels/Pixabay assets don't, so they're tracked separately for
+    # building a credits list (see credits.py).
+    wikimedia_assets_used: list[WikimediaAsset] = field(default_factory=list)
+    # Path to the auto-written `<video>_credits.txt` attribution file, if
+    # `wikimedia_assets_used` was non-empty -- None when no Wikimedia
+    # media was used (the common case), matching pre-feature behavior of
+    # producing no extra output file.
+    credits_file_path: str | None = None
 
 
 def _noop_progress(fraction: float, message: str) -> None:
@@ -59,21 +73,21 @@ def _default_output_path(audio_path: str) -> str:
     return str(OUTPUT_DIR / f"{stem}_{ts}.mp4")
 
 
-def _make_shot_media_resolver(settings: Settings):
+def _make_shot_media_resolver(settings: Settings, deity_queries: frozenset[str] = frozenset()):
     """Build a per-run `resolve(query, prefer_video) -> (local_path, kind)`
-    closure that caches Pexels/Pixabay *search results* per (query,
-    prefer_video) pair and round-robins through the downloaded candidates
-    on repeat calls for the same query.
+    closure that caches search results per (query, prefer_video) pair and
+    round-robins through the downloaded candidates on repeat calls for
+    the same query.
 
-    Why this exists: `shot_planner.plan_shots` deliberately cycles through
-    a short list of keywords (mood-derived or, since the devotional-theme
-    fix, content-derived) across every shot -- a 6-minute track easily
-    reuses each of ~6-8 keywords 15-30+ times. Searching *and downloading*
-    fresh on every single one of those repeats was measured in practice
-    to (a) add one full network round-trip per shot to the render time,
-    and (b) trigger Pexels' rate limiting (HTTP 429) partway through a
-    long track, since a single search call is issued per repeat instead
-    of once per unique keyword.
+    Why the caching exists: `shot_planner.plan_shots` deliberately cycles
+    through a short list of keywords (mood-derived or, since the
+    devotional-theme fix, content-derived) across every shot -- a
+    6-minute track easily reuses each of ~6-8 keywords 15-30+ times.
+    Searching *and downloading* fresh on every single one of those
+    repeats was measured in practice to (a) add one full network
+    round-trip per shot to the render time, and (b) trigger Pexels' rate
+    limiting (HTTP 429) partway through a long track, since a single
+    search call is issued per repeat instead of once per unique keyword.
 
     The fix here searches once per unique (query, prefer_video) pair,
     downloads up to a handful of the results up front, and then serves
@@ -82,22 +96,69 @@ def _make_shot_media_resolver(settings: Settings):
     the same keyword still get some visual variety (not literally the
     same single clip repeated), while collapsing what used to be N search
     API calls (N = how many shots share that keyword) down to 1.
+
+    `deity_queries`, if given (see `content_hints.ContentHints.
+    deity_search_terms`), names the subset of queries that should try
+    Wikimedia Commons *first* -- Wikimedia has real, specific coverage of
+    named deities that Pexels/Pixabay simply don't (searching "Khatu
+    Shyam" on either returns nothing), so for exactly these queries we
+    check Wikimedia before falling back to the normal Pexels/Pixabay
+    flow. Generic mood/devotional keywords ("hindu temple", "diya lamp",
+    ...) are NOT in this set and go straight to Pexels/Pixabay as before
+    -- Wikimedia's search quality for broad, generic terms is noisier
+    (it's an encyclopedia, not a stock-photo library) and untested at
+    that scale, so this integration is deliberately scoped to only the
+    specific, verified-good case: named-deity queries.
     """
     search_cache: dict[tuple[str, bool], list] = {}
     cycle_index: dict[tuple[str, bool], int] = {}
     max_downloads_per_query = 4
+    # Every distinct Wikimedia asset actually downloaded during this run,
+    # in first-use order -- exposed as `resolve.wikimedia_assets_used`
+    # after the caller is done, for building the CC-BY-SA attribution/
+    # credits list (see credits.py). Pexels/Pixabay assets don't require
+    # attribution under their license terms, so only Wikimedia ones are
+    # tracked here.
+    wikimedia_assets_used: list[WikimediaAsset] = []
+    _seen_wikimedia_urls: set[str] = set()
+
+    def _download_wikimedia_candidates(query: str, prefer_video: bool) -> list[WikimediaAsset]:
+        downloaded: list[WikimediaAsset] = []
+        kinds = ["video", "image"] if prefer_video else ["image", "video"]
+        for kind in kinds:
+            if len(downloaded) >= max_downloads_per_query:
+                break
+            for asset in search_wikimedia(query, kind=kind):
+                if len(downloaded) >= max_downloads_per_query:
+                    break
+                if download_wikimedia_asset(asset):
+                    downloaded.append(asset)
+                    if asset.url not in _seen_wikimedia_urls:
+                        _seen_wikimedia_urls.add(asset.url)
+                        wikimedia_assets_used.append(asset)
+        return downloaded
 
     def resolve(query: str, prefer_video: bool) -> tuple[str | None, str]:
         cache_key = (query, prefer_video)
 
         if cache_key not in search_cache:
-            candidates = search_media(query, settings, prefer_video=prefer_video)
-            downloaded = []
-            for asset in candidates:
-                if len(downloaded) >= max_downloads_per_query:
-                    break
-                if download_asset(asset):
-                    downloaded.append(asset)
+            downloaded: list = []
+            if query in deity_queries and settings.use_wikimedia:
+                downloaded = _download_wikimedia_candidates(query, prefer_video)
+                if downloaded:
+                    log.info(
+                        "Wikimedia Commons: found %d asset(s) for deity query %r",
+                        len(downloaded), query,
+                    )
+
+            if not downloaded:
+                candidates = search_media(query, settings, prefer_video=prefer_video)
+                for asset in candidates:
+                    if len(downloaded) >= max_downloads_per_query:
+                        break
+                    if download_asset(asset):
+                        downloaded.append(asset)
+
             search_cache[cache_key] = downloaded
             cycle_index[cache_key] = 0
 
@@ -110,6 +171,7 @@ def _make_shot_media_resolver(settings: Settings):
         asset = downloaded[idx]
         return asset.local_path, asset.kind
 
+    resolve.wikimedia_assets_used = wikimedia_assets_used
     return resolve
 
 
@@ -181,11 +243,20 @@ def run_pipeline(
             f"Devotional/spiritual theme detected ({', '.join(content_hints.matched_terms[:3])}) "
             "— using matching visuals.",
         )
+    if content_hints.deity:
+        report(0.335, f"Specific deity detected: {content_hints.deity} — checking Wikimedia Commons for real footage.")
+
+    # When a specific deity was identified, put its Wikimedia-tuned search
+    # terms *ahead of* the generic devotional keywords in the cycle shots
+    # draw from -- this biases most shots toward the actual named subject
+    # (e.g. "Khatu Shyam") while still mixing in generic devotional
+    # visuals (temple/diya/prayer) for variety across a long track.
+    combined_keywords = (content_hints.deity_search_terms + content_hints.keywords) or None
 
     report(0.34, "Planning beat-synced shots...")
     shots = plan_shots(
         features, mood, transcript=transcript, prefer_video_clips=settings.prefer_video_clips,
-        content_keywords=content_hints.keywords or None,
+        content_keywords=combined_keywords,
         cut_speed_multiplier=content_hints.cut_speed_multiplier,
     )
     report(0.38, f"Planned {len(shots)} shots.")
@@ -196,7 +267,9 @@ def run_pipeline(
     stock_count = 0
     procedural_count = 0
     fetch_span = 0.32  # 38% -> 70%
-    resolve_media_for_shot = _make_shot_media_resolver(settings)
+    resolve_media_for_shot = _make_shot_media_resolver(
+        settings, deity_queries=frozenset(content_hints.deity_search_terms)
+    )
     for i, shot in enumerate(shots):
         check_cancel()
         query = shot.keywords[0] if shot.keywords else mood.keywords[0]
@@ -235,7 +308,19 @@ def run_pipeline(
         progress_cb=render_progress,
     )
     render_seconds = time.time() - start
-    report(1.0, f"Done! Saved to {final_path}")
+
+    # If any Wikimedia Commons media was used, write its CC-license
+    # attribution alongside the video -- see credits.py's module
+    # docstring for why this is required (Wikimedia media, unlike
+    # Pexels/Pixabay, is almost always attribution-licensed). A no-op
+    # (returns None, writes nothing) when the list is empty, which is the
+    # common case for renders that never matched a specific named deity.
+    wikimedia_assets_used = resolve_media_for_shot.wikimedia_assets_used
+    credits_file_path = write_credits_file(wikimedia_assets_used, final_path)
+    if credits_file_path:
+        report(1.0, f"Done! Saved to {final_path} (see {Path(credits_file_path).name} for media credits)")
+    else:
+        report(1.0, f"Done! Saved to {final_path}")
 
     return PipelineResult(
         output_path=final_path,
@@ -246,6 +331,8 @@ def run_pipeline(
         render_seconds=render_seconds,
         used_stock_media_count=stock_count,
         used_procedural_count=procedural_count,
+        wikimedia_assets_used=wikimedia_assets_used,
+        credits_file_path=credits_file_path,
     )
 
 

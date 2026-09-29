@@ -35,19 +35,22 @@ resources**. No paid APIs, no subscriptions required.
        ▼
 3b. Content-theme detect  (filename + lyrics text)  → overrides generic mood
        │                    keywords when a devotional/spiritual theme is
-       │                    detected (see "Content-aware visuals" below)
+       │                    detected, and extracts a *specific* named deity
+       │                    if present (e.g. "Khatu Shyam") — see
+       │                    "Content-aware visuals" below
        ▼
 4. Shot planning                          → beat-aligned list of shots
        │
        ▼
-5. Stock media fetch      (Pexels / Pixabay, optional)  → photo/video per shot
+5. Stock media fetch      (Wikimedia Commons for named deities, then
+       │                   Pexels / Pixabay, optional)  → photo/video per shot
        │                  ↳ falls back to generated visuals if no key / no match
        ▼
 6. Video assembly         (MoviePy / FFmpeg)
        ↳ Ken Burns zoom/pan on stills, crossfades, mood color grading
        ↳ synthetic (+ optional Freesound) SFX layered under your audio
        ▼
-   finished .mp4
+   finished .mp4 (+ a credits.txt if Wikimedia media was used)
 ```
 
 ### Content-aware visuals
@@ -65,6 +68,25 @@ longer/slower to match typical devotional pacing. Naming your file
 descriptively (e.g. keeping "Aarti" or a deity's name in the filename, as
 most downloaded devotional tracks already do) is what triggers this — it
 requires no configuration.
+
+#### Deity-specific footage via Wikimedia Commons
+
+Generic devotional keywords ("temple", "diya lamp", "prayer") already come
+from Pexels/Pixabay, but those libraries have **essentially no coverage of
+named deities** — searching "Khatu Shyam" (or most other specific deity/
+temple names) on either returns nothing. So if a devotional song names a
+*specific* deity — recognized from the filename or transcribed lyrics
+(currently covers Khatu Shyam, Krishna, Radha Krishna, Ram, Sita, Hanuman,
+Shiva, Durga, Kali, Amba Mata, Lakshmi, Saraswati, Ganesh, Vishnu, Sai
+Baba, Balaji, Vaishno Devi, in both English and Devanagari spellings) —
+the app checks **Wikimedia Commons** first for that deity specifically.
+Wikimedia is a free, crowd-sourced media library (the same organization
+behind Wikipedia) populated by devotees photographing/filming their own
+temples and ceremonies, so it has real, on-theme coverage that stock-photo
+sites don't. No sign-up or API key is required for this. It only ever
+activates for this narrow, named-deity case — every other keyword still
+goes to Pexels/Pixabay as before. It can be turned off in **Settings** if
+you'd rather skip it (see the licensing note below for why you might).
 
 Every stage degrades gracefully: with **zero API keys configured**, the app
 still produces a complete video using animated procedural backgrounds and
@@ -177,8 +199,10 @@ variety/realism of the visuals and sound effects.
 | **Pexels** | stock photos & videos | Free, generous rate limits, no credit card | https://www.pexels.com/api/ |
 | **Pixabay** | stock photos & videos | Free, generous rate limits, no credit card | https://pixabay.com/api/docs/ |
 | **Freesound** | real keyword-matched sound effects | Free, no credit card | https://freesound.org/apiv2/apply/ |
+| **Wikimedia Commons** | deity/temple-specific photos & videos | Free, **no sign-up or key needed at all** | n/a — used automatically, toggle in Settings |
 
-Steps (same idea for all three):
+Steps for Pexels/Pixabay/Freesound (Wikimedia needs no key at all — see its
+row above and the "Deity-specific footage" section below):
 1. Create a free account on the provider's site.
 2. Find their "API" / "Developers" page (linked above) and request/generate
    an API key or token.
@@ -216,6 +240,10 @@ checkpoint (in-progress downloads/renders are not partially corrupted).
   Turn this off for faster runs on instrumental-only tracks.
 - **Whisper model size** — tiny/base/small/medium. Bigger = more accurate
   transcription but slower and more memory.
+- **Use Wikimedia Commons for named deities/temples** — on by default,
+  requires no key/sign-up. Turn off if you'd rather every shot come only
+  from Pexels/Pixabay/generated visuals, or to avoid the attribution
+  requirement described in the licensing section below.
 
 ---
 
@@ -245,12 +273,27 @@ checkpoint (in-progress downloads/renders are not partially corrupted).
 - **Freesound** sounds have per-upload licenses (many are Creative
   Commons); if you rely on real Freesound effects (not just the synthetic
   ones), check the individual sound's license on freesound.org.
+- **Wikimedia Commons media is different from the other sources above: it
+  almost always requires attribution.** Nearly everything on Commons is
+  published under a Creative Commons license (typically CC BY 4.0 or
+  CC BY-SA 4.0) that legally requires crediting the original author and
+  linking to the license wherever the work is used. Unlike Pexels/Pixabay,
+  this is **not optional** if you use Wikimedia media (which only happens
+  for the named-deity case described above). To make this easy: whenever
+  a render actually uses Wikimedia media, the app automatically writes a
+  `<video-name>_credits.txt` file next to the finished video, listing
+  every item's title, author, license (with a link), and source page.
+  **Copy that text into the video's description** when you publish it
+  (YouTube, Instagram, etc.) to stay compliant. If you'd rather not deal
+  with this at all, turn off "Use Wikimedia Commons" in Settings — the app
+  will just use Pexels/Pixabay/generated visuals instead, exactly as it
+  did before this feature existed.
 - The **procedurally generated visuals and synthetic SFX** produced by
   this app are code-generated locally and carry no third-party licensing
   restrictions.
-- This tool doesn't remove or add any attribution automatically — if a
-  provider's terms require attribution for a specific use case, add it
-  yourself.
+- Aside from the automatic Wikimedia credits file above, this tool doesn't
+  remove or add any attribution automatically — if a provider's terms
+  require attribution for a specific use case, add it yourself.
 
 ---
 
@@ -268,6 +311,8 @@ audio2video/
 │   │   ├── transcribe.py        optional local speech-to-text (faster-whisper)
 │   │   ├── shot_planner.py      beat-aligned shot list
 │   │   ├── media_fetcher.py     Pexels/Pixabay free stock media client
+│   │   ├── wikimedia_fetcher.py Wikimedia Commons client (named-deity footage)
+│   │   ├── credits.py           builds the Wikimedia attribution credits file
 │   │   ├── procedural_visuals.py fallback animated visuals (PIL/numpy)
 │   │   ├── sfx.py               synthetic SFX + optional Freesound client
 │   │   ├── video_builder.py     MoviePy assembly: Ken Burns, grading, mux
@@ -319,3 +364,11 @@ print(result.output_path, result.mood.label)
   devotional/spiritual vocabulary — other specific themes (e.g. weddings,
   travel vlogs) still rely on the generic acoustic mood classifier's
   keywords.
+- Named-deity detection (Wikimedia Commons) only recognizes a curated list
+  of deity names (see "Deity-specific footage" above); a devotional song
+  naming a deity outside that list still falls back to generic devotional
+  keywords via Pexels/Pixabay, same as before this feature existed.
+  Wikimedia's search/coverage also varies by deity — very well-known
+  deities (Krishna, Hanuman, Shiva, ...) tend to have far more real photos
+  and video than more regional/local ones, so visual variety per deity is
+  not guaranteed to be equally rich across the list.

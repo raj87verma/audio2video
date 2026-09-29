@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import shutil
+import subprocess as sp
 import tempfile
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
+from moviepy.config import get_setting
 from moviepy.editor import (
     AudioFileClip,
     CompositeAudioClip,
@@ -208,6 +211,91 @@ def make_ken_burns_frame_fn(
 
 
 # ---------------------------------------------------------------------------
+# Non-square pixel (SAR) correction for source videos
+# ---------------------------------------------------------------------------
+
+_SAR_RE = re.compile(r"\bSAR\s+(\d+):(\d+)\b")
+
+
+def _probe_pixel_aspect_ratio(video_path: str) -> float:
+    """Return the video's Sample Aspect Ratio (SAR) as a float (width_factor
+    / height_factor), or 1.0 if it can't be determined / is already square.
+
+    Why this exists: MoviePy 1.0.3's `FFMPEG_VideoReader` (moviepy/video/io/
+    ffmpeg_reader.py) parses only the raw *coded* pixel dimensions out of
+    ffmpeg's `Video: ... WxH ...` info line -- it never looks at SAR/DAR at
+    all. Most stock footage (Pexels/Pixabay) is encoded with square pixels
+    (SAR 1:1), so this has never mattered for this app until now. But real
+    devotee-submitted phone recordings on Wikimedia Commons are frequently
+    encoded with non-square pixels: e.g. a real "Mangal Aarti" video used
+    during testing reports coded size 1080x1080 but `SAR 76:135` (i.e. its
+    *true* display size is 1080 * 76/135 = 608 wide x 1080 tall -- a
+    portrait phone video, not a square one). Without correcting for this,
+    every frame MoviePy reads is silently ~1.78x horizontally stretched
+    relative to how it's meant to look, before `cover_resize_crop` even
+    runs -- verified with this exact file: raw ffmpeg frame extraction
+    with `-vf scale=608:1080` (the SAR-corrected size) looks visually
+    correct/undistorted, while both direct `ffprobe`/`ffmpeg` default
+    decode and MoviePy's `VideoFileClip.get_frame()` (coded 1080x1080,
+    no SAR applied) come out stretched.
+
+    We shell out to the same ffmpeg binary MoviePy itself resolves via
+    `get_setting("FFMPEG_BINARY")` (so this works identically in the
+    PyInstaller-bundled app, which vendors ffmpeg through imageio-ffmpeg,
+    not just in dev environments with a system ffmpeg) and parse the
+    `SAR W:H` token straight out of its stderr banner -- ffmpeg always
+    prints this for any input that has a non-default sample aspect ratio,
+    with no extra flags needed.
+    """
+    try:
+        proc = sp.run(
+            [get_setting("FFMPEG_BINARY"), "-i", video_path],
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+            stdin=sp.DEVNULL,
+            timeout=10,
+        )
+        info = proc.stderr.decode("utf8", errors="ignore")
+        match = _SAR_RE.search(info)
+        if not match:
+            return 1.0
+        num, den = int(match.group(1)), int(match.group(2))
+        if den == 0:
+            return 1.0
+        return num / den
+    except Exception:
+        # Any probing failure (missing binary, unexpected output, timeout)
+        # should never break rendering -- fall back to "assume square
+        # pixels", which is what every previous release effectively did.
+        log.warning("Could not probe pixel aspect ratio for %s; assuming square pixels", video_path, exc_info=True)
+        return 1.0
+
+
+def _correct_non_square_pixels(raw: VideoFileClip, video_path: str) -> VideoFileClip:
+    """If `raw`'s source file has a non-1:1 Sample Aspect Ratio, resize it
+    to its true display dimensions so downstream processing (cover-fit
+    crop, Ken-Burns-equivalent, color grading, etc.) operates on correctly
+    proportioned frames instead of MoviePy's raw (SAR-ignorant) coded size.
+    A no-op (returns `raw` unchanged) for the common square-pixel case, so
+    this costs nothing for ordinary Pexels/Pixabay footage.
+    """
+    sar = _probe_pixel_aspect_ratio(video_path)
+    if abs(sar - 1.0) < 1e-3:
+        return raw
+    coded_w, coded_h = raw.size
+    display_w = coded_w * sar
+    # Resize to the true display size, keeping height fixed and scaling
+    # width by the SAR factor -- this is the standard SAR-correction
+    # convention (height is the "reference" axis; DAR = SAR * coded_w/coded_h).
+    corrected = raw.resize(newsize=(int(round(display_w)), coded_h))
+    log.info(
+        "Corrected non-square pixels for %s: coded %dx%d (SAR %.4f) -> display %dx%d",
+        video_path, coded_w, coded_h, sar, corrected.w, corrected.h,
+    )
+    return corrected
+
+
+# ---------------------------------------------------------------------------
 # Cover-fit resize/crop (for video clips and procedural clips)
 # ---------------------------------------------------------------------------
 
@@ -234,6 +322,16 @@ def build_image_shot_clip(
     image_path: str, shot: Shot, target_w: int, target_h: int, fps: int, grade: str
 ) -> VideoClip:
     img = Image.open(image_path)
+    # Apply EXIF orientation before anything else. Phone-camera photos
+    # (very common among Wikimedia Commons devotional uploads -- see
+    # wikimedia_fetcher.py -- which are largely devotee-submitted phone
+    # photos of temples/murtis, unlike Pexels/Pixabay's pre-processed
+    # stock photography) frequently store an EXIF `Orientation` tag
+    # instead of storing pixels already rotated upright. `Image.open()`
+    # ignores that tag, so without this the image renders sideways or
+    # upside-down. Verified: without this fix, a real downloaded Khatu
+    # Shyam temple photo rendered rotated 90 degrees.
+    img = ImageOps.exif_transpose(img)
     frame_fn = make_ken_burns_frame_fn(
         img, shot.duration, target_w, target_h, shot.zoom_direction, shot.pan_direction
     )
@@ -280,17 +378,26 @@ def build_video_shot_clip(
     raw_clips_to_close = [raw]
     needed = shot.duration
 
-    if raw.duration >= needed:
+    # Correct non-square pixels (see _correct_non_square_pixels docstring)
+    # before anything else touches frame dimensions. `raw` itself is left
+    # untouched (still tracked in raw_clips_to_close for cleanup, since it
+    # owns the underlying FFmpeg subprocess); `source` is what the rest of
+    # this function actually reads frames from.
+    source = _correct_non_square_pixels(raw, video_path)
+
+    if source.duration >= needed:
         # centered subclip so we don't always start at frame 0 of stock footage
-        max_start = max(0.0, raw.duration - needed)
+        max_start = max(0.0, source.duration - needed)
         start = min(max_start, max_start / 2)
-        clip = raw.subclip(start, start + needed)
+        clip = source.subclip(start, start + needed)
     else:
         # loop short stock clips to cover the shot duration. Each repeated
-        # reference in `[raw] * loops` is the *same* object, so this does
-        # not open extra subprocesses -- `raw` alone still covers it.
-        loops = int(math.ceil(needed / raw.duration))
-        clip = concatenate_videoclips([raw] * loops).subclip(0, needed)
+        # reference in `[source] * loops` is the *same* object (whether
+        # that's `raw` itself or the SAR-corrected wrapper around it), so
+        # this does not open extra subprocesses -- `raw` alone still
+        # covers it, same as before the SAR-correction was added.
+        loops = int(math.ceil(needed / source.duration))
+        clip = concatenate_videoclips([source] * loops).subclip(0, needed)
 
     clip = cover_resize_crop(clip, target_w, target_h)
     clip = clip.fl_image(lambda f: apply_color_grade(f, grade))
