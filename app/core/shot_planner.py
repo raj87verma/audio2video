@@ -102,14 +102,26 @@ def plan_shots(
     mood: MoodProfile,
     transcript: TranscriptResult | None = None,
     prefer_video_clips: bool = True,
+    content_keywords: list[str] | None = None,
+    cut_speed_multiplier: float | None = None,
 ) -> list[Shot]:
     """Produce an ordered list of Shot objects covering the full audio duration.
 
     Cut points are snapped to detected beats when enough beats were found
     (typical for real music); otherwise falls back to uniform-length shots
     so the planner never fails even on beat-less/ambient/noisy audio.
+
+    `content_keywords`, if given (see `content_hints.detect_content_hints`),
+    take priority over the acoustic mood's own keywords for any shot that
+    has no lyric-derived keywords of its own -- this lets a detected
+    devotional/spiritual theme (or similar content-level signal) override
+    generic tempo/loudness-based mood keywords like "celebration" or
+    "dance" that would otherwise fetch visuals with no connection to what
+    the song is actually about.
     """
     target_duration = _target_shot_duration(features, mood)
+    if cut_speed_multiplier:
+        target_duration = float(np.clip(target_duration * cut_speed_multiplier, MIN_SHOT_DURATION, MAX_SHOT_DURATION))
 
     boundaries = _boundaries_from_beats(features, target_duration)
     if len(boundaries) < 2:
@@ -121,6 +133,7 @@ def plan_shots(
 
     onset_times = features.onset_times if features.onset_times is not None else np.array([])
     mood_keyword_cycle = cycle(mood.keywords) if mood.keywords else cycle(["abstract background"])
+    content_keyword_cycle = cycle(content_keywords) if content_keywords else None
     zoom_cycle = cycle(_ZOOM_DIRECTIONS)
     pan_cycle = cycle(_PAN_DIRECTIONS)
 
@@ -141,11 +154,15 @@ def plan_shots(
             highlight_time = float(in_window[0])
             is_highlight = True
 
-        # Keywords: prefer lyric/vocal keywords for this window, fall back
-        # to cycling through the mood's keyword list for visual variety.
+        # Keywords: prefer lyric/vocal keywords for this window, then a
+        # content-hint override (e.g. devotional theme detected from the
+        # filename), then fall back to cycling through the mood's keyword
+        # list for visual variety.
         keywords: list[str] = []
         if transcript is not None and transcript.has_speech:
             keywords = transcript.keywords_in(start, end, limit=3)
+        if not keywords and content_keyword_cycle is not None:
+            keywords = [next(content_keyword_cycle)]
         if not keywords:
             keywords = [next(mood_keyword_cycle)]
 

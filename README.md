@@ -33,6 +33,10 @@ resources**. No paid APIs, no subscriptions required.
 3. Lyrics/speech detect   (faster-whisper, optional, local) → keywords from vocals
        │
        ▼
+3b. Content-theme detect  (filename + lyrics text)  → overrides generic mood
+       │                    keywords when a devotional/spiritual theme is
+       │                    detected (see "Content-aware visuals" below)
+       ▼
 4. Shot planning                          → beat-aligned list of shots
        │
        ▼
@@ -45,6 +49,22 @@ resources**. No paid APIs, no subscriptions required.
        ▼
    finished .mp4
 ```
+
+### Content-aware visuals
+
+The acoustic mood classifier (step 2) only looks at tempo/loudness/timbre
+— it has no idea what a song is actually *about*, which can pick oddly
+generic keywords (e.g. "celebration", "dance") for devotional music that
+happens to be acoustically upbeat. To help with this, the pipeline also
+checks the audio file's **filename** (and any transcribed lyrics) for
+devotional/spiritual vocabulary (aarti, bhajan, kirtan, temple, and deity
+names, in both English transliteration and Devanagari) — if found, shot
+keywords switch to devotional-themed terms (temple, diya lamp, incense,
+prayer, ...) instead of the generic mood keywords, and shots are made
+longer/slower to match typical devotional pacing. Naming your file
+descriptively (e.g. keeping "Aarti" or a deity's name in the filename, as
+most downloaded devotional tracks already do) is what triggers this — it
+requires no configuration.
 
 Every stage degrades gracefully: with **zero API keys configured**, the app
 still produces a complete video using animated procedural backgrounds and
@@ -290,4 +310,12 @@ print(result.output_path, result.mood.label)
   well (the app silently falls back to mood-based keywords in that case).
 - Rendering time scales with video length/resolution/fps and whether stock
   video clips (vs. stills) are used, since video decoding/re-encoding is
-  more expensive than still-image Ken Burns animation.
+  more expensive than still-image Ken Burns animation. As a rough guide,
+  a ~6-minute track at 1080p typically renders in the range of tens of
+  minutes rather than hours; very long tracks (10+ minutes) or 4K output
+  will take proportionally longer. Lowering the resolution/fps in Settings
+  is the most effective way to speed up a render.
+- Content-theme detection (see above) currently only recognizes a curated
+  devotional/spiritual vocabulary — other specific themes (e.g. weddings,
+  travel vlogs) still rely on the generic acoustic mood classifier's
+  keywords.
