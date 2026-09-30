@@ -42,9 +42,11 @@ resources**. No paid APIs, no subscriptions required.
 4. Shot planning                          → beat-aligned list of shots
        │
        ▼
-5. Media fetch  (your own supplied photos/videos, if any, for every shot;
-       │         else Wikimedia Commons for named deities; else
-       │         Pexels / Pixabay, optional)  → photo/video per shot
+5. Media fetch  (your local-only media folder, if configured, for every
+       │         shot in every song; else your own deity-specific photos/
+       │         videos, if any, for every shot in a matching song; else
+       │         Wikimedia Commons for named deities; else Pexels /
+       │         Pixabay, optional)  → photo/video per shot
        │        ↳ falls back to generated visuals if none of the above match
        ▼
 6. Video assembly         (MoviePy / FFmpeg)
@@ -54,7 +56,68 @@ resources**. No paid APIs, no subscriptions required.
    finished .mp4 (+ a credits.txt if Wikimedia media was used)
 ```
 
-### Use your own photos/videos (highest priority)
+### Local-only mode: use ONLY your own media, for every song (highest priority)
+
+If you'd rather Audio2Video never call out to Wikimedia/Pexels/Pixabay at
+all — for any song, not just devotional ones — point it at a folder of
+your own royalty-free photos/videos and it will use **only** that folder,
+permanently, until you turn it off again.
+
+**How to set it up:** open the app's **Settings** tab → find "Local-Only
+Media Folder" → click **Browse...** and pick any folder on your computer
+(it doesn't need to exist yet, or be empty — pick wherever makes sense for
+you). Audio2Video automatically creates two subfolders inside it:
+
+```
+<the folder you picked>/
+  images/    <- put your photos here
+  videos/    <- put your video clips here
+```
+
+Drop any number of files into `images/` and `videos/` (supported formats:
+`.jpg`/`.jpeg`/`.png`/`.bmp`/`.webp` for images, `.mp4`/`.mov`/`.webm`/
+`.mkv`/`.avi`/`.m4v` for videos). The Settings tab shows a live count of
+how many of each it finds.
+
+**Once a folder is set here, this is a permanent, global switch:**
+- Every song you process from then on uses ONLY the files in this folder
+  — Wikimedia Commons, Pexels, and Pixabay are never contacted again, for
+  any song, regardless of its filename/lyrics/mood.
+- If the folder happens to be empty (or you haven't added files yet),
+  shots simply use the generated animated backgrounds instead — it does
+  **not** fall back to any online source, ever, while this is set.
+- Click **Clear** in Settings to turn this off and go back to the normal
+  Wikimedia/Pexels/Pixabay behavior described below.
+
+What happens with your files (same treatment as the deity-specific folder
+below):
+- **Videos** are used in short, randomly varied 2-4 second excerpts per
+  shot — never the whole clip at once. If a shot needs more than 4
+  seconds (shot length varies with the song's tempo/mood), that short
+  excerpt simply loops to fill the remaining time rather than jumping to
+  a different part of the video mid-shot.
+- **Photos** get the same Ken Burns pan/zoom and color grading as any
+  other still image, plus a subtle animated glow + twinkling sparkle
+  effect on top, so they don't look flat/static next to the rest of the
+  video.
+- If you have both images and videos in the folder, shots mix between
+  them (not "all video until it runs out, then all photos") so a song
+  actually uses the variety you've supplied.
+
+**How this relates to the deity-specific folder below:** this local-only
+folder is a single, simple, always-on switch that applies to every song.
+The "Use your own photos/videos" feature described next is lighter-weight
+— it only activates for a song about a specific *recognized deity*, and
+still falls back online if that deity's folder happens to be empty. If
+you configure **both**, this local-only folder takes priority for
+everything, and the deity-specific folder is never consulted at all.
+
+Only use media you actually have the rights to use for this (your own
+photos/videos, or ones whose license explicitly permits it) — this
+feature doesn't check licensing for you, since it's your own supplied
+files.
+
+### Use your own photos/videos (per recognized deity)
 
 Even with deity-specific Wikimedia footage (below), a song's shots still
 cycle through a *mix* of the deity's own visuals and generic devotional
@@ -292,9 +355,18 @@ checkpoint (in-progress downloads/renders are not partially corrupted).
   from Pexels/Pixabay/generated visuals, or to avoid the attribution
   requirement described in the licensing section below.
 - **Your Own Deity Photos/Videos folder** — a read-only path display plus
-  an **Open Folder** button; see "Use your own photos/videos" above.
-  There's no on/off toggle for this one — it's simply used whenever the
-  matching deity subfolder has at least one supported file in it.
+  an **Open Folder** button; see "Use your own photos/videos (per
+  recognized deity)" above. There's no on/off toggle for this one — it's
+  simply used whenever the matching deity subfolder has at least one
+  supported file in it (and only when the local-only folder below isn't
+  set).
+- **Local-Only Media Folder** — an editable path field plus **Browse...**,
+  **Clear**, and **Open Folder** buttons, and a live image/video count;
+  see "Local-only mode" above. Empty (the default) means this is off and
+  the app behaves as described everywhere else in this README. Setting
+  a folder here is a **permanent, global** switch — it takes priority
+  over every other visual source, for every song, until you click
+  **Clear**.
 
 ---
 
@@ -305,9 +377,10 @@ checkpoint (in-progress downloads/renders are not partially corrupted).
   soft pastel, neutral cinematic), crossfade transitions between shots, and
   — whenever no stock footage matches — a fully generated animated
   background (gradient + drifting particles + a live waveform visualizer
-  reacting to your track's actual loudness). Your own supplied deity
-  photos additionally get a subtle animated glow + twinkling sparkle
-  overlay (see "Use your own photos/videos" above).
+  reacting to your track's actual loudness). Any photos you supply
+  yourself (via either the local-only folder or the per-deity folder)
+  additionally get a subtle animated glow + twinkling sparkle overlay —
+  see "Local-only mode" and "Use your own photos/videos" above.
 - **SFX**: a layer of procedurally synthesized whooshes, impacts, risers
   and sparkles, automatically placed at shot transitions and at strong
   musical accents (onsets) in high-energy sections — mixed underneath your
@@ -366,6 +439,7 @@ audio2video/
 │   │   ├── media_fetcher.py     Pexels/Pixabay free stock media client
 │   │   ├── wikimedia_fetcher.py Wikimedia Commons client (named-deity footage)
 │   │   ├── user_media.py        scans the user's own supplied deity photos/videos
+│   │   ├── local_media.py       scans the permanent local-only-media folder
 │   │   ├── credits.py           builds the Wikimedia attribution credits file
 │   │   ├── procedural_visuals.py fallback animated visuals (PIL/numpy)
 │   │   ├── sfx.py               synthetic SFX + optional Freesound client
@@ -426,9 +500,12 @@ print(result.output_path, result.mood.label)
   deities (Krishna, Hanuman, Shiva, ...) tend to have far more real photos
   and video than more regional/local ones, so visual variety per deity is
   not guaranteed to be equally rich across the list.
-- Your own supplied media (see "Use your own photos/videos" above) is an
-  all-or-nothing switch per song: as soon as the matching deity folder has
-  at least one supported file, *every* shot in that song uses your own
-  media, with no way to mix in Wikimedia/Pexels/Pixabay visuals alongside
-  it for extra variety. If you want a mix, that currently means manually
-  supplying enough of your own variety to cover the whole song.
+- Your own supplied media (via either the per-deity folder or the
+  local-only folder — see the two "Use your own photos/videos" /
+  "Local-only mode" sections above) is an all-or-nothing switch: as soon
+  as it applies, *every* shot uses only your own media, with no way to
+  mix in Wikimedia/Pexels/Pixabay visuals alongside it for extra variety.
+  For the local-only folder this is global (every song, permanently,
+  until you click Clear); for the per-deity folder it's just per-song. If
+  you want a mix, that currently means manually supplying enough of your
+  own variety to cover the whole song.

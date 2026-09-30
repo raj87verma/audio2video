@@ -56,6 +56,22 @@ class Settings:
     # typically CC BY-SA, which requires crediting the author -- see the
     # auto-generated credits file this produces).
     use_wikimedia: bool = True
+    # Absolute path to a user-chosen folder (containing `images/` and
+    # `videos/` subfolders -- see local_media.py) that, once set,
+    # PERMANENTLY replaces every online media source (Wikimedia, Pexels,
+    # Pixabay) for every song -- not just devotional/deity ones. This is
+    # a stronger, simpler alternative to the deity-specific
+    # `user_media.py` mechanism: that one only activates for songs where
+    # a specific deity is detected and still falls back online if its
+    # per-deity folder happens to be empty; this one is an explicit,
+    # global, all-or-nothing switch the user opts into deliberately via
+    # Settings, and never calls out to the internet for visuals at all
+    # once set, regardless of song content or whether the folder
+    # currently has any usable files in it (see local_media.py's module
+    # docstring and pipeline.py's use of it for the exact no-fallback
+    # behavior this implies). Empty string means "not set" -- i.e. use
+    # the existing Wikimedia/Pexels/Pixabay/user_media behavior as before.
+    local_media_dir: str = ""
     extra: dict = field(default_factory=dict)
 
     @classmethod

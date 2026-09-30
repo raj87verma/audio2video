@@ -385,28 +385,42 @@ def build_video_shot_clip(
     target_h: int,
     fps: int,
     grade: str,
-    random_start: bool = False,
+    trim_seconds: tuple[float, float] | None = None,
 ) -> VideoClip:
     """Build a shot clip from a downloaded stock video file.
 
-    `random_start`, when True, picks a uniformly random start point within
-    the source instead of the fixed "centered" start below. This is used
-    specifically for a user's own supplied video(s) (see `user_media.py` /
-    `pipeline._make_user_media_resolver`): since a song typically has many
-    more shots than a user is likely to supply distinct video files for,
-    the *same* file gets reused across many shots (via round-robin
-    cycling in the resolver) -- with the default fixed-centered start,
-    every one of those reuses would show the exact same few seconds of
-    footage over and over, which looks obviously repetitive over a
-    multi-minute video. A random start each time gives real variety (a
-    different 3-5-second-ish excerpt of the same clip) across repeated
-    uses. Left False (the previous, already-verified behavior) for
-    Wikimedia/Pexels/Pixabay videos, where each shot already gets a
-    genuinely different downloaded file most of the time (see
-    `_make_shot_media_resolver`'s per-query candidate cycling), so a
-    random start there would mostly just add noise without a real
-    benefit, and changing it would mean re-verifying an already-tested
-    code path for no gain.
+    `trim_seconds`, when given as a `(min, max)` range in seconds, first
+    extracts one short, randomly-positioned trim of a randomly-chosen
+    length in that range from the source -- e.g. `(2.0, 4.0)` picks
+    somewhere between 2 and 4 seconds of random footage from a random
+    point in the source -- and then treats *that trim* (not the original
+    full source) as what gets shown for the shot: if the shot needs less
+    than the trim's own length, a centered piece of the trim is used; if
+    the shot needs more (a shot's `duration` can legitimately be longer
+    than a few seconds, depending on tempo/mood pacing), the short trim is
+    looped to fill the remaining time (see the loop branch below -- this
+    is the same "loop short clips to cover the shot duration" logic
+    already used for any video shorter than its shot, just applied to the
+    trim instead of the raw source).
+
+    This is used for the user's own supplied video(s) -- both the
+    deity-specific folder (`user_media.py` / `pipeline.
+    _make_user_media_resolver`) and the permanent local-only-media folder
+    (`local_media.py` / `pipeline._make_local_media_resolver`) -- since a
+    song typically has many more shots than a user is likely to supply
+    distinct video files for, so the *same* file gets reused across many
+    shots (via round-robin cycling in the resolver). Without this, every
+    one of those reuses would show either the exact same fixed segment
+    (if always centered) or an arbitrarily long stretch starting at a
+    random point (if only randomizing the start) -- neither gives the
+    short, varied few-second excerpts a user asking for "2-4 second
+    clips" per shot actually wants. Left `None` (the previous,
+    already-verified behavior) for Wikimedia/Pexels/Pixabay videos, where
+    each shot already gets a genuinely different downloaded file most of
+    the time (see `_make_shot_media_resolver`'s per-query candidate
+    cycling), so trimming there would mostly just add complexity without
+    a real benefit, and changing it would mean re-verifying an
+    already-tested code path for no gain.
 
     IMPORTANT resource-management note: `VideoFileClip` opens an FFmpeg
     subprocess (a real OS process + pipe) for the lifetime of the object,
@@ -445,18 +459,35 @@ def build_video_shot_clip(
     # this function actually reads frames from.
     source = _correct_non_square_pixels(raw, video_path)
 
+    if trim_seconds is not None:
+        # Pick a random trim length within the requested range (clamped
+        # to the source's own duration, in case a supplied video is
+        # itself shorter than the requested minimum trim length -- e.g. a
+        # 3s source with trim_seconds=(2.0, 4.0) simply gets used in full
+        # rather than raising or producing an invalid subclip range).
+        # A fresh Random() per call (not seeded) is deliberate -- the
+        # whole point is that repeated calls for the *same* source file
+        # (across many shots reusing a small set of user-supplied videos)
+        # land on different excerpts each time, which a fixed seed would
+        # defeat.
+        lo, hi = trim_seconds
+        trim_len = min(random.uniform(lo, hi), source.duration)
+        max_trim_start = max(0.0, source.duration - trim_len)
+        trim_start = random.uniform(0.0, max_trim_start)
+        # Reassign `source` to the short trim itself -- everything below
+        # (the "does it need looping to fill the shot" logic) then
+        # operates on this short trim exactly as it would on a naturally
+        # short source video, so a single random trim naturally loops to
+        # fill however long the shot actually needs.
+        source = source.subclip(trim_start, trim_start + trim_len)
+
     if source.duration >= needed:
         max_start = max(0.0, source.duration - needed)
-        if random_start:
-            # A fresh Random() per call (not seeded) is deliberate here --
-            # the whole point is that repeated calls for the *same* source
-            # file (across many shots reusing a small set of user-supplied
-            # videos) land on different excerpts each time, which a fixed
-            # seed would defeat.
-            start = random.uniform(0.0, max_start)
-        else:
-            # centered subclip so we don't always start at frame 0 of stock footage
-            start = min(max_start, max_start / 2)
+        # Centered subclip of whatever `source` is at this point (either
+        # the original full video, when trim_seconds is None, or the
+        # short random trim from just above) -- avoids always starting
+        # at frame 0.
+        start = min(max_start, max_start / 2)
         clip = source.subclip(start, start + needed)
     else:
         # loop short stock clips to cover the shot duration. Each repeated
@@ -534,28 +565,39 @@ def build_shot_clip(
 ) -> VideoClip:
     """Dispatch to the right clip builder based on resolved media `kind`.
 
-    `kind` is one of 'image', 'video', 'user_image', 'user_video', or
-    'procedural' (also used whenever `local_path` is falsy/missing, so a
-    bad download never breaks the shot). The 'user_*' kinds (see
-    `user_media.py` / `pipeline._make_user_media_resolver`) get the same
-    underlying builder as their plain counterparts, plus the extra
-    treatment meant specifically for the user's own supplied media: a
-    glow/sparkle VFX overlay for stills, and a randomized (not fixed)
-    start point for video excerpts -- see `build_image_shot_clip`'s
-    `add_vfx_overlay` and `build_video_shot_clip`'s `random_start` params.
+    `kind` is one of 'image', 'video', 'user_image', 'user_video',
+    'local_image', 'local_video', or 'procedural' (also used whenever
+    `local_path` is falsy/missing, so a bad download never breaks the
+    shot). The 'user_*' kinds (see `user_media.py` / `pipeline.
+    _make_user_media_resolver`, the deity-specific folder) and the
+    'local_*' kinds (see `local_media.py` / `pipeline.
+    _make_local_media_resolver`, the permanent local-only-media folder)
+    both get the same underlying builder as their plain counterparts,
+    plus the extra treatment meant specifically for user-supplied media:
+    a glow/sparkle VFX overlay for stills, and a short randomized
+    (2-4 second) trim for video excerpts -- see `build_image_shot_clip`'s
+    `add_vfx_overlay` and `build_video_shot_clip`'s `trim_seconds` params.
     """
+    # 2-4 second random trims -- see build_video_shot_clip's docstring --
+    # for both flavors of user-supplied video ('user_video' from the
+    # deity-specific folder, 'local_video' from the permanent
+    # local-only-media folder). Defined once here so both dispatch
+    # branches below share the exact same range.
+    _USER_VIDEO_TRIM_RANGE = (2.0, 4.0)
+
     try:
         if kind == "image" and local_path:
             return build_image_shot_clip(local_path, shot, target_w, target_h, fps, mood.color_grade)
-        if kind == "user_image" and local_path:
+        if kind in ("user_image", "local_image") and local_path:
             return build_image_shot_clip(
                 local_path, shot, target_w, target_h, fps, mood.color_grade, add_vfx_overlay=True
             )
         if kind == "video" and local_path:
             return build_video_shot_clip(local_path, shot, target_w, target_h, fps, mood.color_grade)
-        if kind == "user_video" and local_path:
+        if kind in ("user_video", "local_video") and local_path:
             return build_video_shot_clip(
-                local_path, shot, target_w, target_h, fps, mood.color_grade, random_start=True
+                local_path, shot, target_w, target_h, fps, mood.color_grade,
+                trim_seconds=_USER_VIDEO_TRIM_RANGE,
             )
     except Exception as exc:
         # If building the video clip failed partway through (e.g. "failed
