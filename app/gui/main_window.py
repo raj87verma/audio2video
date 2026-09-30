@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
 
 from ..config import RESOLUTION_CHOICES, WHISPER_MODEL_CHOICES, Settings
 from ..core.local_media import ensure_local_media_subdirs, scan_local_media_dir
-from ..core.user_media import ensure_user_media_dirs
 from .worker import PipelineWorker
 
 AUDIO_FILE_FILTER = "Audio files (*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.wma);;All files (*.*)"
@@ -165,32 +164,12 @@ class CreateVideoTab(QWidget):
         self.status_label.setText(f"Done! Mood: {result.mood.label} — saved to {result.output_path}")
         self.log_view.appendPlainText(
             f"\nFinished. Mood='{result.mood.label}', shots={len(result.shots)}, "
-            f"stock_media={result.used_stock_media_count}, "
-            f"local_media={result.used_local_media_count}, "
-            f"your_own_media={result.used_user_media_count}, procedural={result.used_procedural_count}, "
+            f"local_media={result.used_local_media_count}, procedural={result.used_procedural_count}, "
             f"render_time={result.render_seconds:.1f}s"
         )
         if result.used_local_media_count:
             self.log_view.appendPlainText(
-                f"\nUsed your local-only media folder for all {result.used_local_media_count} shot(s) "
-                "in this video (online sources were not used at all)."
-            )
-        elif result.used_user_media_count:
-            self.log_view.appendPlainText(
-                f"\nUsed your own supplied photos/videos for all {result.used_user_media_count} shot(s) "
-                "in this video (see Settings tab for the folder)."
-            )
-        # Wikimedia Commons media (unlike Pexels/Pixabay) generally requires
-        # crediting the original author under its CC license -- surface that
-        # clearly rather than leaving it buried only in the credits .txt file
-        # on disk, since it's a real compliance requirement for whoever
-        # publishes this video, not just an FYI.
-        if result.wikimedia_assets_used:
-            self.log_view.appendPlainText(
-                f"\nThis video uses {len(result.wikimedia_assets_used)} media item(s) from "
-                "Wikimedia Commons, which require crediting the original author. "
-                f"A credits file was saved to:\n{result.credits_file_path}\n"
-                "Please include this credit text in the video's description when you publish it."
+                f"\nUsed your local media folder for {result.used_local_media_count} shot(s) in this video."
             )
         self._reset_buttons(finished=True)
 
@@ -222,109 +201,12 @@ class SettingsTab(QWidget):
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
 
-        keys_group = QGroupBox("Free Stock Media & SFX API Keys (all optional)")
-        form = QFormLayout()
-        self.pexels_edit = QLineEdit()
-        self.pexels_edit.setEchoMode(QLineEdit.Password)
-        self.pixabay_edit = QLineEdit()
-        self.pixabay_edit.setEchoMode(QLineEdit.Password)
-        self.freesound_edit = QLineEdit()
-        self.freesound_edit.setEchoMode(QLineEdit.Password)
-        form.addRow("Pexels API key:", self.pexels_edit)
-        form.addRow("Pixabay API key:", self.pixabay_edit)
-        form.addRow("Freesound API key:", self.freesound_edit)
-        keys_group.setLayout(form)
-        layout.addWidget(keys_group)
-
-        note = QLabel(
-            "Leave any key blank to skip that provider — the app will still\n"
-            "produce a complete video using procedurally generated visuals\n"
-            "and synthetic sound effects. See the About tab for free sign-up links."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-
-        video_group = QGroupBox("Video Settings")
-        vform = QFormLayout()
-        self.resolution_combo = QComboBox()
-        self.resolution_combo.addItems(RESOLUTION_CHOICES)
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(10, 60)
-        self.prefer_video_check = QCheckBox("Prefer stock video clips over still images when available")
-        vform.addRow("Resolution:", self.resolution_combo)
-        vform.addRow("Frame rate (fps):", self.fps_spin)
-        vform.addRow(self.prefer_video_check)
-        video_group.setLayout(vform)
-        layout.addWidget(video_group)
-
-        speech_group = QGroupBox("Lyrics / Speech Detection (runs fully offline, first use downloads a small model)")
-        sform = QFormLayout()
-        self.use_stt_check = QCheckBox("Detect lyrics/speech to guide visual keywords")
-        self.whisper_combo = QComboBox()
-        self.whisper_combo.addItems(WHISPER_MODEL_CHOICES)
-        sform.addRow(self.use_stt_check)
-        sform.addRow("Whisper model size:", self.whisper_combo)
-        speech_group.setLayout(sform)
-        layout.addWidget(speech_group)
-
-        wikimedia_group = QGroupBox("Wikimedia Commons (deity-specific footage — no sign-up needed)")
-        wform = QFormLayout()
-        self.use_wikimedia_check = QCheckBox(
-            "Use Wikimedia Commons for named deities/temples (e.g. Khatu Shyam, Hanuman)"
-        )
-        wform.addRow(self.use_wikimedia_check)
-        wikimedia_note = QLabel(
-            "When a devotional song's filename or lyrics name a specific deity, the app\n"
-            "checks Wikimedia Commons first for real matching photos/footage — something\n"
-            "Pexels/Pixabay don't have. Only used for that narrow case; everything else\n"
-            "still uses Pexels/Pixabay/generated visuals as usual.\n"
-            "Note: unlike Pexels/Pixabay, Wikimedia media requires crediting the original\n"
-            "author (Creative Commons license). When used, the app automatically writes a\n"
-            "'<video>_credits.txt' file next to the output — include that text in the\n"
-            "video's description when you publish it."
-        )
-        wikimedia_note.setWordWrap(True)
-        wform.addRow(wikimedia_note)
-        wikimedia_group.setLayout(wform)
-        layout.addWidget(wikimedia_group)
-
-        user_media_group = QGroupBox("Your Own Deity Photos/Videos (highest priority — no sign-up needed)")
-        umform = QFormLayout()
-        # ensure_user_media_dirs() also creates the per-deity subfolders
-        # (with an explanatory README.txt in each) the first time the
-        # Settings tab is built, so a folder is always ready to browse to
-        # here even if the user has never processed a matching song yet.
-        self._user_media_dir = ensure_user_media_dirs()
-        self.user_media_path_edit = QLineEdit(str(self._user_media_dir))
-        self.user_media_path_edit.setReadOnly(True)
-        open_user_media_btn = QPushButton("Open Folder")
-        open_user_media_btn.clicked.connect(self._open_user_media_folder)
-        path_row = QHBoxLayout()
-        path_row.addWidget(self.user_media_path_edit, stretch=1)
-        path_row.addWidget(open_user_media_btn)
-        umform.addRow("Folder:", path_row)
-        user_media_note = QLabel(
-            "If a song is about a specific deity Audio2Video recognizes (see the folder\n"
-            "names inside — Khatu Shyam, Krishna, Hanuman, etc.), drop your own\n"
-            "royalty-free photos/videos of that deity into the matching subfolder.\n"
-            "When you do, Audio2Video uses ONLY your own files for every shot in that\n"
-            "song — it skips Wikimedia Commons, Pexels and Pixabay entirely for it, so\n"
-            "the whole video matches your own footage instead of generic visuals.\n"
-            "Videos are used in randomly-varied few-second excerpts across shots, and\n"
-            "photos automatically get a subtle animated glow/sparkle effect added.\n"
-            "Leave the folder empty to keep using Wikimedia/Pexels/Pixabay as before."
-        )
-        user_media_note.setWordWrap(True)
-        umform.addRow(user_media_note)
-        user_media_group.setLayout(umform)
-        layout.addWidget(user_media_group)
-
         local_media_group = QGroupBox(
-            "Local-Only Media Folder (PERMANENT — completely disables all online sources)"
+            "Media Folder (your own photos/videos — the ONLY visual source Audio2Video uses)"
         )
         lmform = QFormLayout()
         self.local_media_path_edit = QLineEdit()
-        self.local_media_path_edit.setPlaceholderText("No folder selected — online sources are used as usual")
+        self.local_media_path_edit.setPlaceholderText("No folder selected — videos will use generated visuals")
         local_browse_btn = QPushButton("Browse...")
         local_browse_btn.clicked.connect(self._browse_local_media_folder)
         local_clear_btn = QPushButton("Clear")
@@ -341,25 +223,47 @@ class SettingsTab(QWidget):
         self.local_media_count_label.setWordWrap(True)
         lmform.addRow(self.local_media_count_label)
         local_media_note = QLabel(
-            "Point this at any folder of your own royalty-free photos/videos, organized\n"
-            "into two subfolders — \"images\" and \"videos\" — inside it (created\n"
-            "automatically the first time you pick a folder here). Once a folder is set,\n"
-            "Audio2Video uses ONLY the files in it for EVERY song you process, for EVERY\n"
-            "shot — it never calls Wikimedia Commons, Pexels, or Pixabay again, for any\n"
-            "song, until you clear this field. This is different from \"Your Own Deity\n"
-            "Photos/Videos\" above, which only activates for songs about a specific\n"
-            "recognized deity and still falls back online if that folder is empty — this\n"
-            "one is a single global switch that applies to everything, with no online\n"
-            "fallback at all (an empty folder just means generated visuals are used\n"
-            "instead). If both are set, this folder takes priority over everything else.\n"
-            "Videos are used in short, randomly varied 2-4 second excerpts per shot;\n"
-            "photos automatically get a subtle animated glow/sparkle effect added.\n"
-            "Click \"Clear\" to turn this off and go back to the normal online sources."
+            "Audio2Video does not use Pexels, Pixabay, Wikimedia Commons, or any other\n"
+            "online resource for visuals — it never has an option to. The only source\n"
+            "of real photos/videos is a folder you choose here, organized into two\n"
+            "subfolders — \"images\" and \"videos\" — created automatically the first\n"
+            "time you pick a folder below.\n\n"
+            "Every shot in every video you create cycles through the files in this\n"
+            "folder (images and videos mixed together). If the folder is empty or no\n"
+            "folder is set, shots use an animated generated background instead — this\n"
+            "never changes based on the song, since there is no online source to fall\n"
+            "back to.\n\n"
+            "Videos are used in short, randomly varied 2-4 second excerpts per shot —\n"
+            "never the whole clip at once — looping that excerpt if a shot needs more\n"
+            "than 4 seconds. Photos get an automatic animated glow + twinkling sparkle\n"
+            "effect added on top of the usual pan/zoom, so they don't look static.\n\n"
+            "Click \"Clear\" to unset the folder and use only generated visuals."
         )
         local_media_note.setWordWrap(True)
         lmform.addRow(local_media_note)
         local_media_group.setLayout(lmform)
         layout.addWidget(local_media_group)
+
+        video_group = QGroupBox("Video Settings")
+        vform = QFormLayout()
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItems(RESOLUTION_CHOICES)
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(10, 60)
+        vform.addRow("Resolution:", self.resolution_combo)
+        vform.addRow("Frame rate (fps):", self.fps_spin)
+        video_group.setLayout(vform)
+        layout.addWidget(video_group)
+
+        speech_group = QGroupBox("Lyrics / Speech Detection (runs fully offline, first use downloads a small model)")
+        sform = QFormLayout()
+        self.use_stt_check = QCheckBox("Detect lyrics/speech (used only to pace devotional content, see About tab)")
+        self.whisper_combo = QComboBox()
+        self.whisper_combo.addItems(WHISPER_MODEL_CHOICES)
+        sform.addRow(self.use_stt_check)
+        sform.addRow("Whisper model size:", self.whisper_combo)
+        speech_group.setLayout(sform)
+        layout.addWidget(speech_group)
 
         save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self._save)
@@ -368,15 +272,10 @@ class SettingsTab(QWidget):
 
     def _load_from_settings(self) -> None:
         s = self.settings
-        self.pexels_edit.setText(s.pexels_api_key)
-        self.pixabay_edit.setText(s.pixabay_api_key)
-        self.freesound_edit.setText(s.freesound_api_key)
         self.resolution_combo.setCurrentText(s.target_resolution)
         self.fps_spin.setValue(s.fps)
-        self.prefer_video_check.setChecked(s.prefer_video_clips)
         self.use_stt_check.setChecked(s.use_speech_to_text)
         self.whisper_combo.setCurrentText(s.whisper_model_size)
-        self.use_wikimedia_check.setChecked(s.use_wikimedia)
         self.local_media_path_edit.setText(s.local_media_dir)
         self._refresh_local_media_count()
 
@@ -400,13 +299,12 @@ class SettingsTab(QWidget):
         else:
             self.local_media_count_label.setText(
                 "This folder currently has no usable images/videos in it — "
-                "shots will use generated visuals until you add some (online "
-                "sources will still stay disabled)."
+                "shots will use generated visuals until you add some."
             )
 
     def _browse_local_media_folder(self) -> None:
         start_dir = self.local_media_path_edit.text().strip() or str(Path.home())
-        path = QFileDialog.getExistingDirectory(self, "Choose your local media folder", start_dir)
+        path = QFileDialog.getExistingDirectory(self, "Choose your media folder", start_dir)
         if not path:
             return
         try:
@@ -437,34 +335,14 @@ class SettingsTab(QWidget):
             elif sys.platform.startswith("win"):
                 os.startfile(folder)  # type: ignore[attr-defined]
         except Exception:
-            QMessageBox.information(self, "Folder location", f"Your local media folder is at:\n{folder}")
-
-    def _open_user_media_folder(self) -> None:
-        # Mirrors CreateVideoTab._open_output_folder's platform-specific
-        # "reveal in file manager" logic (same fallback-to-message-box
-        # pattern if the platform-specific opener call itself fails).
-        folder = str(self._user_media_dir)
-        try:
-            if sys.platform.startswith("linux"):
-                subprocess.Popen(["xdg-open", folder])
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
-            elif sys.platform.startswith("win"):
-                os.startfile(folder)  # type: ignore[attr-defined]
-        except Exception:
             QMessageBox.information(self, "Folder location", f"Your media folder is at:\n{folder}")
 
     def _save(self) -> None:
         s = self.settings
-        s.pexels_api_key = self.pexels_edit.text().strip()
-        s.pixabay_api_key = self.pixabay_edit.text().strip()
-        s.freesound_api_key = self.freesound_edit.text().strip()
         s.target_resolution = self.resolution_combo.currentText()
         s.fps = self.fps_spin.value()
-        s.prefer_video_clips = self.prefer_video_check.isChecked()
         s.use_speech_to_text = self.use_stt_check.isChecked()
         s.whisper_model_size = self.whisper_combo.currentText()
-        s.use_wikimedia = self.use_wikimedia_check.isChecked()
         s.local_media_dir = self.local_media_path_edit.text().strip()
         s.save()
         self._refresh_local_media_count()
@@ -475,54 +353,34 @@ class SettingsTab(QWidget):
 ABOUT_HTML = """
 <h2>Audio2Video</h2>
 <p>Turns an audio file into an automatically edited video using
-<b>free and open resources only</b>:</p>
+<b>only local, free, and open resources — no online media of any kind</b>:</p>
 <ul>
   <li><b>Audio analysis</b> — tempo, beats, energy, mood (librosa, runs locally)</li>
   <li><b>Lyrics/speech detection</b> — faster-whisper, runs fully offline</li>
-  <li><b>Stock visuals</b> — <a href="https://www.pexels.com/api/">Pexels</a> and
-      <a href="https://pixabay.com/api/docs/">Pixabay</a> free APIs (free sign-up, no credit card)</li>
-  <li><b>Local-only media folder</b> — the absolute highest priority. Point the
-      <b>Settings</b> tab at any folder of your own royalty-free photos/videos and
-      Audio2Video will use ONLY that folder, for every song, for every shot — it
-      permanently stops calling Wikimedia/Pexels/Pixabay entirely until you clear it</li>
-  <li><b>Your own deity photos/videos</b> — a lighter-weight alternative to the above.
-      Drop your own royalty-free deity photos/videos into the per-deity folder shown in
-      the <b>Settings</b> tab, and Audio2Video uses ONLY those for every shot in a matching
-      song, skipping Wikimedia/Pexels/Pixabay entirely for it (still falls back online for
-      other songs, unlike the local-only folder above)</li>
-  <li><b>Deity-specific visuals</b> — <a href="https://commons.wikimedia.org/">Wikimedia Commons</a>
-      (no sign-up/API key needed at all). Used automatically when a devotional song's filename
-      or lyrics name a specific deity or temple (e.g. Khatu Shyam, Hanuman) and you haven't
-      supplied your own media for it — Pexels/Pixabay have no coverage of these, but Wikimedia
-      has real devotee-submitted photos and video</li>
-  <li><b>Procedural fallback visuals</b> — generated locally, used automatically whenever
-      no API key is configured or no stock result matches</li>
-  <li><b>Sound effects</b> — synthetic (numpy-generated) by default, optionally
-      real keyword-matched effects via <a href="https://freesound.org/apiv2/apply/">Freesound</a>
-      (free API token)</li>
+  <li><b>Your own media folder</b> — the only source of real photos/videos.
+      Point the <b>Settings</b> tab at a folder of your own royalty-free photos/videos
+      and every shot in every video cycles through it. Videos are shown in short,
+      randomly varied 2-4 second excerpts; photos get an automatic animated
+      glow/sparkle effect added</li>
+  <li><b>Procedural generated visuals</b> — animated gradient/particle/waveform
+      backgrounds, generated locally, used automatically whenever no media folder
+      is configured or it's empty</li>
+  <li><b>Sound effects</b> — synthetic, numpy-generated whooshes/impacts/risers/sparkles,
+      beat-synced to your track</li>
   <li><b>Rendering</b> — MoviePy + FFmpeg</li>
 </ul>
-<p><b>Getting free API keys (optional, but improves visual variety):</b></p>
-<ol>
-  <li>Pexels: sign up at pexels.com and request a free API key at
-      <a href="https://www.pexels.com/api/">pexels.com/api</a></li>
-  <li>Pixabay: sign up at pixabay.com and get your key at
-      <a href="https://pixabay.com/api/docs/">pixabay.com/api/docs</a></li>
-  <li>Freesound (optional, for real SFX): apply at
-      <a href="https://freesound.org/apiv2/apply/">freesound.org/apiv2/apply</a></li>
-</ol>
-<p>Paste the keys into the <b>Settings</b> tab. The app works completely without any
-of them — it just relies more on generated visuals and synthetic sound effects.</p>
-<p><b>License note:</b> Pexels and Pixabay content is free to use per their own
-license terms; always check the current license text on their sites before
-redistributing generated videos commercially. <b>Wikimedia Commons media is
-different</b> — it's almost always published under a Creative Commons license
-(typically CC BY or CC BY-SA) that <b>requires crediting the original author</b>.
-Whenever a render uses any Wikimedia media, the app automatically writes a
-<code>&lt;video-name&gt;_credits.txt</code> file next to the output listing every
-item's title, author and license link — include that text in the video's
-description (YouTube, Instagram, etc.) when you publish it. You can turn
-Wikimedia off entirely in the Settings tab if you'd rather skip this.</p>
+<p>Audio2Video has <b>no settings, options, or code paths that contact Pexels,
+Pixabay, Wikimedia Commons, Freesound, or any other online service</b> — every
+visual and sound effect is either something you supplied yourself in a local
+folder, or generated on your own machine.</p>
+<p><b>Content-aware pacing:</b> if a song's filename or lyrics suggest devotional/
+spiritual content (aarti, bhajan, kirtan, a deity's name, ...), shots are made
+longer and slower to match typical contemplative pacing — this only affects
+timing, not which visuals are used.</p>
+<p><b>Licensing:</b> only use media you actually have the rights to use in your
+media folder (your own photos/videos, or ones whose license explicitly permits
+this kind of use) — Audio2Video doesn't check licensing for you, since every
+file in that folder is something you chose to put there.</p>
 """
 
 

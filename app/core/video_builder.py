@@ -2,11 +2,11 @@
 
 Responsibilities:
   - Ken Burns zoom/pan animation for still images (numpy/PIL, frame-exact).
-  - Cover-fit resize/crop for stock video clips and procedural clips.
+  - Cover-fit resize/crop for the user's own video clips and procedural clips.
   - Mood-based color grading (simple numpy color-matrix operations).
   - Crossfade transitions between shots.
-  - A synthetic + optional-Freesound SFX layer, beat/highlight-synced,
-    mixed underneath the original audio track.
+  - A synthetic SFX layer, beat/highlight-synced, mixed underneath the
+    original audio track.
   - Final mux + H.264/AAC MP4 export via MoviePy/FFmpeg.
 
 Every function here is designed to be callable and testable in isolation
@@ -225,20 +225,18 @@ def _probe_pixel_aspect_ratio(video_path: str) -> float:
     Why this exists: MoviePy 1.0.3's `FFMPEG_VideoReader` (moviepy/video/io/
     ffmpeg_reader.py) parses only the raw *coded* pixel dimensions out of
     ffmpeg's `Video: ... WxH ...` info line -- it never looks at SAR/DAR at
-    all. Most stock footage (Pexels/Pixabay) is encoded with square pixels
-    (SAR 1:1), so this has never mattered for this app until now. But real
-    devotee-submitted phone recordings on Wikimedia Commons are frequently
-    encoded with non-square pixels: e.g. a real "Mangal Aarti" video used
-    during testing reports coded size 1080x1080 but `SAR 76:135` (i.e. its
-    *true* display size is 1080 * 76/135 = 608 wide x 1080 tall -- a
-    portrait phone video, not a square one). Without correcting for this,
-    every frame MoviePy reads is silently ~1.78x horizontally stretched
-    relative to how it's meant to look, before `cover_resize_crop` even
-    runs -- verified with this exact file: raw ffmpeg frame extraction
-    with `-vf scale=608:1080` (the SAR-corrected size) looks visually
-    correct/undistorted, while both direct `ffprobe`/`ffmpeg` default
-    decode and MoviePy's `VideoFileClip.get_frame()` (coded 1080x1080,
-    no SAR applied) come out stretched.
+    all. Real phone-camera video recordings are frequently encoded with
+    non-square pixels: e.g. a real test video reported coded size
+    1080x1080 but `SAR 76:135` (i.e. its *true* display size is
+    1080 * 76/135 = 608 wide x 1080 tall -- a portrait phone video, not a
+    square one). Without correcting for this, every frame MoviePy reads
+    is silently ~1.78x horizontally stretched relative to how it's meant
+    to look, before `cover_resize_crop` even runs -- verified with this
+    exact file: raw ffmpeg frame extraction with `-vf scale=608:1080`
+    (the SAR-corrected size) looks visually correct/undistorted, while
+    both direct `ffprobe`/`ffmpeg` default decode and MoviePy's
+    `VideoFileClip.get_frame()` (coded 1080x1080, no SAR applied) come
+    out stretched.
 
     We shell out to the same ffmpeg binary MoviePy itself resolves via
     `get_setting("FFMPEG_BINARY")` (so this works identically in the
@@ -278,7 +276,7 @@ def _correct_non_square_pixels(raw: VideoFileClip, video_path: str) -> VideoFile
     crop, Ken-Burns-equivalent, color grading, etc.) operates on correctly
     proportioned frames instead of MoviePy's raw (SAR-ignorant) coded size.
     A no-op (returns `raw` unchanged) for the common square-pixel case, so
-    this costs nothing for ordinary Pexels/Pixabay footage.
+    this costs nothing for ordinary video files.
     """
     sar = _probe_pixel_aspect_ratio(video_path)
     if abs(sar - 1.0) < 1e-3:
@@ -332,28 +330,20 @@ def build_image_shot_clip(
 
     `add_vfx_overlay`, when True, additionally composites a subtle
     animated glow + drifting-sparkle effect on top (see
-    `procedural_visuals.render_glow_sparkle_overlay`). This is used
-    specifically for the user's own supplied deity photos (see
-    `user_media.py` / `pipeline._make_user_media_resolver`) -- a static
-    personal photo otherwise looks comparatively flat/motionless next to
-    the animated procedural-fallback shots and stock-video shots
-    elsewhere in the same render, and the user explicitly asked for
-    "animations and vfx" on their own images. Left off by default (and
-    for Wikimedia/Pexels/Pixabay images) since those already look
-    intentional as plain Ken-Burns stills and this hasn't been asked for
-    there -- keeping the default behavior byte-for-byte unchanged for
-    every already-verified code path.
+    `procedural_visuals.render_glow_sparkle_overlay`). This is used for
+    the user's own supplied photos (see `local_media.py` / `pipeline.
+    _make_local_media_resolver`) -- a static personal photo otherwise
+    looks comparatively flat/motionless next to the animated procedural-
+    fallback shots elsewhere in the same render, and users have
+    explicitly asked for "animations and vfx" on their own images.
     """
     img = Image.open(image_path)
     # Apply EXIF orientation before anything else. Phone-camera photos
-    # (very common among Wikimedia Commons devotional uploads -- see
-    # wikimedia_fetcher.py -- which are largely devotee-submitted phone
-    # photos of temples/murtis, unlike Pexels/Pixabay's pre-processed
-    # stock photography) frequently store an EXIF `Orientation` tag
-    # instead of storing pixels already rotated upright. `Image.open()`
-    # ignores that tag, so without this the image renders sideways or
-    # upside-down. Verified: without this fix, a real downloaded Khatu
-    # Shyam temple photo rendered rotated 90 degrees.
+    # frequently store an EXIF `Orientation` tag instead of storing
+    # pixels already rotated upright. `Image.open()` ignores that tag, so
+    # without this the image renders sideways or upside-down. Verified
+    # with a real phone-camera photo (rotated before this fix, correct
+    # after it).
     img = ImageOps.exif_transpose(img)
     frame_fn = make_ken_burns_frame_fn(
         img, shot.duration, target_w, target_h, shot.zoom_direction, shot.pan_direction
@@ -403,24 +393,17 @@ def build_video_shot_clip(
     already used for any video shorter than its shot, just applied to the
     trim instead of the raw source).
 
-    This is used for the user's own supplied video(s) -- both the
-    deity-specific folder (`user_media.py` / `pipeline.
-    _make_user_media_resolver`) and the permanent local-only-media folder
-    (`local_media.py` / `pipeline._make_local_media_resolver`) -- since a
+    This is used for the user's own supplied video(s) (see
+    `local_media.py` / `pipeline._make_local_media_resolver`) -- since a
     song typically has many more shots than a user is likely to supply
     distinct video files for, so the *same* file gets reused across many
     shots (via round-robin cycling in the resolver). Without this, every
     one of those reuses would show either the exact same fixed segment
     (if always centered) or an arbitrarily long stretch starting at a
     random point (if only randomizing the start) -- neither gives the
-    short, varied few-second excerpts a user asking for "2-4 second
-    clips" per shot actually wants. Left `None` (the previous,
-    already-verified behavior) for Wikimedia/Pexels/Pixabay videos, where
-    each shot already gets a genuinely different downloaded file most of
-    the time (see `_make_shot_media_resolver`'s per-query candidate
-    cycling), so trimming there would mostly just add complexity without
-    a real benefit, and changing it would mean re-verifying an
-    already-tested code path for no gain.
+    short, varied few-second excerpts asked for. Left `None` for any
+    caller that wants the original full-video behavior (e.g. tests
+    exercising the plain path directly).
 
     IMPORTANT resource-management note: `VideoFileClip` opens an FFmpeg
     subprocess (a real OS process + pipe) for the lifetime of the object,
@@ -436,7 +419,7 @@ def build_video_shot_clip(
     Without doing this explicitly, every stock-video shot leaks one
     running FFmpeg process for the remainder of the program's life. On a
     long track with hundreds of video shots (very much the common case
-    once free Pexels/Pixabay API keys are configured, since video is
+    if the user's local media folder favors video, since video is
     preferred over stills), this silently accumulates until the process
     exhausts memory/handles and crashes -- even though the *reported*
     per-batch clips are being closed correctly, because none of those
@@ -552,6 +535,13 @@ def build_procedural_shot_clip(
     return clip.set_fps(fps)
 
 
+
+# Random 2-4 second video trims for the user's own supplied footage (see
+# build_video_shot_clip's `trim_seconds` docstring) -- module-level since
+# every "local_video" shot uses the same range.
+_LOCAL_VIDEO_TRIM_RANGE = (2.0, 4.0)
+
+
 def build_shot_clip(
     shot: Shot,
     local_path: str | None,
@@ -565,39 +555,24 @@ def build_shot_clip(
 ) -> VideoClip:
     """Dispatch to the right clip builder based on resolved media `kind`.
 
-    `kind` is one of 'image', 'video', 'user_image', 'user_video',
-    'local_image', 'local_video', or 'procedural' (also used whenever
-    `local_path` is falsy/missing, so a bad download never breaks the
-    shot). The 'user_*' kinds (see `user_media.py` / `pipeline.
-    _make_user_media_resolver`, the deity-specific folder) and the
-    'local_*' kinds (see `local_media.py` / `pipeline.
-    _make_local_media_resolver`, the permanent local-only-media folder)
-    both get the same underlying builder as their plain counterparts,
-    plus the extra treatment meant specifically for user-supplied media:
-    a glow/sparkle VFX overlay for stills, and a short randomized
-    (2-4 second) trim for video excerpts -- see `build_image_shot_clip`'s
-    `add_vfx_overlay` and `build_video_shot_clip`'s `trim_seconds` params.
+    `kind` is `"local_image"`, `"local_video"`, or `"procedural"` (also
+    used whenever `local_path` is falsy/missing, so a bad/unreadable file
+    never breaks the shot). The `"local_*"` kinds (see `local_media.py` /
+    `pipeline._make_local_media_resolver` -- the user's own media folder)
+    get the extra treatment meant for user-supplied media: a glow/sparkle
+    VFX overlay for stills, and a short randomized (2-4 second) trim for
+    video excerpts -- see `build_image_shot_clip`'s `add_vfx_overlay` and
+    `build_video_shot_clip`'s `trim_seconds` params.
     """
-    # 2-4 second random trims -- see build_video_shot_clip's docstring --
-    # for both flavors of user-supplied video ('user_video' from the
-    # deity-specific folder, 'local_video' from the permanent
-    # local-only-media folder). Defined once here so both dispatch
-    # branches below share the exact same range.
-    _USER_VIDEO_TRIM_RANGE = (2.0, 4.0)
-
     try:
-        if kind == "image" and local_path:
-            return build_image_shot_clip(local_path, shot, target_w, target_h, fps, mood.color_grade)
-        if kind in ("user_image", "local_image") and local_path:
+        if kind == "local_image" and local_path:
             return build_image_shot_clip(
                 local_path, shot, target_w, target_h, fps, mood.color_grade, add_vfx_overlay=True
             )
-        if kind == "video" and local_path:
-            return build_video_shot_clip(local_path, shot, target_w, target_h, fps, mood.color_grade)
-        if kind in ("user_video", "local_video") and local_path:
+        if kind == "local_video" and local_path:
             return build_video_shot_clip(
                 local_path, shot, target_w, target_h, fps, mood.color_grade,
-                trim_seconds=_USER_VIDEO_TRIM_RANGE,
+                trim_seconds=_LOCAL_VIDEO_TRIM_RANGE,
             )
     except Exception as exc:
         # If building the video clip failed partway through (e.g. "failed

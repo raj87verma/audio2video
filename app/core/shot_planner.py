@@ -39,7 +39,6 @@ class Shot:
     highlight_time: float | None  # absolute time of the triggering onset, if any
     zoom_direction: str           # 'in' / 'out' for Ken Burns effect
     pan_direction: str            # 'left' / 'right' / 'up' / 'down' / 'none'
-    prefer_video: bool            # True -> try to fetch a video clip; False -> still image is fine
 
     @property
     def duration(self) -> float:
@@ -101,10 +100,7 @@ def plan_shots(
     features: AudioFeatures,
     mood: MoodProfile,
     transcript: TranscriptResult | None = None,
-    prefer_video_clips: bool = True,
-    content_keywords: list[str] | None = None,
     cut_speed_multiplier: float | None = None,
-    prioritize_content_keywords: bool = False,
 ) -> list[Shot]:
     """Produce an ordered list of Shot objects covering the full audio duration.
 
@@ -112,30 +108,20 @@ def plan_shots(
     (typical for real music); otherwise falls back to uniform-length shots
     so the planner never fails even on beat-less/ambient/noisy audio.
 
-    `content_keywords`, if given (see `content_hints.detect_content_hints`),
-    take priority over the acoustic mood's own keywords for any shot that
-    has no lyric-derived keywords of its own -- this lets a detected
-    devotional/spiritual theme (or similar content-level signal) override
-    generic tempo/loudness-based mood keywords like "celebration" or
-    "dance" that would otherwise fetch visuals with no connection to what
-    the song is actually about.
+    `cut_speed_multiplier`, if given (see
+    `content_hints.detect_content_hints`), scales the base per-shot
+    duration the acoustic mood classifier would otherwise pick -- used to
+    slow down devotional/spiritual content to a more contemplative pace
+    than its tempo/loudness alone would suggest.
 
-    `prioritize_content_keywords`, when True, flips that order so
-    `content_keywords` are tried *before* lyric-derived keywords instead
-    of after. This exists for devotional content specifically: real
-    devotional lyrics (aarti/bhajan) are overwhelmingly invocation/
-    grammar words -- "tera" (your), "karo" (do), "jai" (hail), "kalyan"
-    (welfare), "bhakto" (devotees) -- which are not visual search terms
-    and mean nothing to a stock-media API, unlike a pop song's lyrics
-    which might genuinely describe a scene ("dancing in the rain"). Left
-    at the default (lyric keywords first), a devotional song with clear
-    vocals would have its correctly-detected deity/devotional keywords
-    silently discarded in favor of these meaningless transcribed words
-    for almost every shot, sending searches for "tera"/"karo" instead of
-    "Khatu Shyam" -- defeating the entire purpose of content_hints'
-    devotional/deity detection. Non-devotional callers should leave this
-    False so genuinely useful lyric-derived keywords keep taking priority
-    as before.
+    `shot.keywords` (still populated below from transcript/mood, purely
+    for the progress-log "Fetching visuals for shot N (keyword)..."
+    message) has no effect on which media is actually used: Audio2Video
+    has no online media search to route a keyword to (see
+    `local_media.py`) -- every shot's actual visual is either the user's
+    own local media (round-robin, keyword-independent -- see
+    `pipeline._make_local_media_resolver`) or a procedurally generated
+    background (mood-driven, also keyword-independent).
     """
     target_duration = _target_shot_duration(features, mood)
     if cut_speed_multiplier:
@@ -151,7 +137,6 @@ def plan_shots(
 
     onset_times = features.onset_times if features.onset_times is not None else np.array([])
     mood_keyword_cycle = cycle(mood.keywords) if mood.keywords else cycle(["abstract background"])
-    content_keyword_cycle = cycle(content_keywords) if content_keywords else None
     zoom_cycle = cycle(_ZOOM_DIRECTIONS)
     pan_cycle = cycle(_PAN_DIRECTIONS)
 
@@ -172,32 +157,15 @@ def plan_shots(
             highlight_time = float(in_window[0])
             is_highlight = True
 
-        # Keywords: normally prefer lyric/vocal keywords for this window,
-        # then a content-hint override (e.g. devotional theme detected
-        # from the filename), then fall back to cycling through the
-        # mood's keyword list for visual variety. When
-        # `prioritize_content_keywords` is set (devotional content -- see
-        # this function's docstring), content keywords are tried first
-        # instead, since transcribed devotional lyrics are almost never
-        # useful visual search terms.
+        # Keywords here are cosmetic only (used purely for the progress
+        # log's "Fetching visuals for shot N (keyword)..." message) --
+        # Audio2Video has no online media search to route them to (see
+        # this function's docstring). Prefer lyric/vocal keywords for
+        # this window when available (genuinely descriptive of the
+        # moment), else cycle through the mood's own keyword list.
         keywords: list[str] = []
-        transcript_keywords_fn = (
-            (lambda: transcript.keywords_in(start, end, limit=3))
-            if transcript is not None and transcript.has_speech
-            else (lambda: [])
-        )
-        content_keywords_fn = (
-            (lambda: [next(content_keyword_cycle)]) if content_keyword_cycle is not None else (lambda: [])
-        )
-        ordered_sources = (
-            [content_keywords_fn, transcript_keywords_fn]
-            if prioritize_content_keywords
-            else [transcript_keywords_fn, content_keywords_fn]
-        )
-        for source in ordered_sources:
-            keywords = source()
-            if keywords:
-                break
+        if transcript is not None and transcript.has_speech:
+            keywords = transcript.keywords_in(start, end, limit=3)
         if not keywords:
             keywords = [next(mood_keyword_cycle)]
 
@@ -212,7 +180,6 @@ def plan_shots(
                 highlight_time=highlight_time,
                 zoom_direction=next(zoom_cycle),
                 pan_direction=next(pan_cycle),
-                prefer_video=prefer_video_clips,
             )
         )
 

@@ -1,21 +1,13 @@
-"""Lets a user point Audio2Video at a single local folder of their own
-royalty-free photos/videos and use ONLY that folder for every song's
-visuals -- permanently disabling Wikimedia Commons, Pexels, and Pixabay
-entirely, for every song, not just devotional/deity ones.
+"""Lets a user point Audio2Video at a folder of their own royalty-free
+photos/videos -- the ONLY source of real photos/videos this app has.
 
-Why this exists (and how it differs from `user_media.py`): `user_media.py`
-is deity-aware -- it only kicks in for a song whose filename/lyrics name a
-specific recognized deity, and only bypasses online sources for THAT song
-if its matching per-deity subfolder happens to have files in it; every
-other song (or an empty subfolder) still falls back to Wikimedia/Pexels/
-Pixabay as usual. Real user feedback was that this wasn't what they
-wanted at all: they explicitly do not want the app calling out to
-Pexels/Pixabay/Wikimedia under any circumstance, for any song, once
-they've supplied their own asset folder -- a single, simple, permanent
-switch, not a per-song/per-deity fallback chain.
+Audio2Video has no online media sources of any kind (no Pexels, no
+Pixabay, no Wikimedia Commons, nothing) -- every shot's visual either
+comes from this local folder, or is procedurally generated
+(`procedural_visuals.py`).
 
-This module implements exactly that: a single folder path (stored in
-`Settings.local_media_dir`), with two fixed subfolders:
+Folder layout: a single path (stored in `Settings.local_media_dir`), with
+two fixed subfolders:
 
     <local_media_dir>/
       images/    <- any number of photos
@@ -24,27 +16,29 @@ This module implements exactly that: a single folder path (stored in
 `ensure_local_media_subdirs()` creates these two subfolders under
 whatever path the user has chosen (idempotent, safe to call repeatedly).
 `scan_local_media_dir()` returns every usable image/video found in them.
-
-Callers (see `pipeline.py`) are responsible for treating
-`Settings.local_media_dir` being non-empty as an unconditional, permanent
-switch: once set, Wikimedia/Pexels/Pixabay/deity-specific `user_media.py`
-must never be consulted for any song, even if this folder is currently
-empty (in which case shots simply fall back to the procedural generator,
-exactly like "no stock media available" already does elsewhere in this
-app) -- there is deliberately no "folder empty -> fall back online" path
-here, unlike `user_media.py`'s per-deity behavior.
+An empty or unset folder simply means every shot falls back to the
+procedural generator (see `pipeline.py`) -- there is no other source to
+fall back to.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-
-from .user_media import _SUPPORTED_IMAGE_EXTS, _SUPPORTED_VIDEO_EXTS, UserMediaAsset
 
 log = logging.getLogger(__name__)
 
 IMAGES_SUBDIR_NAME = "images"
 VIDEOS_SUBDIR_NAME = "videos"
+
+_SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+
+
+@dataclass
+class LocalMediaAsset:
+    kind: str    # 'image' or 'video'
+    local_path: str
 
 
 def ensure_local_media_subdirs(base_dir: str | Path) -> tuple[Path, Path]:
@@ -53,12 +47,9 @@ def ensure_local_media_subdirs(base_dir: str | Path) -> tuple[Path, Path]:
     repeatedly -- never touches any files that already exist there.
 
     Raises whatever `Path.mkdir()` would raise (e.g. permission denied)
-    -- unlike `user_media.py`'s dedicated per-deity folders (which are
-    created automatically at app startup, so failures there are silently
-    logged), this is called right after the user actively picks a folder
-    in a file dialog, so a real error here (e.g. picked a read-only
-    location) should surface to the user immediately rather than fail
-    silently.
+    -- this is called right after the user actively picks a folder in a
+    file dialog, so a real error here (e.g. picked a read-only location)
+    should surface to the user immediately rather than fail silently.
     """
     base = Path(base_dir)
     images_dir = base / IMAGES_SUBDIR_NAME
@@ -68,24 +59,22 @@ def ensure_local_media_subdirs(base_dir: str | Path) -> tuple[Path, Path]:
     return images_dir, videos_dir
 
 
-def _scan_subdir(folder: Path, kind: str, exts: set[str]) -> list[UserMediaAsset]:
-    assets: list[UserMediaAsset] = []
+def _scan_subdir(folder: Path, kind: str, exts: set[str]) -> list[LocalMediaAsset]:
+    assets: list[LocalMediaAsset] = []
     if not folder.is_dir():
         return assets
     for path in sorted(folder.iterdir()):
         if path.is_file() and path.suffix.lower() in exts:
-            assets.append(UserMediaAsset(kind=kind, local_path=str(path)))
+            assets.append(LocalMediaAsset(kind=kind, local_path=str(path)))
     return assets
 
 
-def scan_local_media_dir(base_dir: str | Path) -> list[UserMediaAsset]:
+def scan_local_media_dir(base_dir: str | Path) -> list[LocalMediaAsset]:
     """Return every usable image/video file found in
     `<base_dir>/images/` and `<base_dir>/videos/`.
 
     Non-recursive within each subfolder, never raises (a missing/
-    inaccessible folder just yields an empty list for that subfolder --
-    see this module's docstring for why an empty result here must NOT
-    trigger a fallback to online sources in the caller).
+    inaccessible folder just yields an empty list).
     """
     base = Path(base_dir)
     try:

@@ -6,10 +6,17 @@ Wires together every core module in order:
   2. mood.classify_mood                — rule-based mood + keywords + color grade
   3. transcribe.transcribe_audio       — optional local speech-to-text (lyrics)
   4. shot_planner.plan_shots           — beat-aligned shot list
-  5. media_fetcher.fetch_best_asset    — per-shot stock photo/video (Pexels/Pixabay)
+  5. local_media.scan_local_media_dir  — the user's own local photos/videos
      (procedural_visuals is used automatically as the video_builder's
-     fallback whenever a shot has no resolved asset)
+     fallback whenever the local media folder is empty or unset)
   6. video_builder.assemble_video      — final render + SFX mix + export
+
+Audio2Video uses NO online media sources of any kind for visuals -- every
+shot's picture/video either comes from the user's own local media folder
+(see `local_media.py` / `Settings.local_media_dir`) or is procedurally
+generated (see `procedural_visuals.py`). There is nothing to configure
+here that reaches the network for images/video, and nothing ever will,
+by design.
 
 Exposes a single `run_pipeline(...)` function with a `progress_cb` hook so
 the GUI (or a CLI) can report fine-grained progress without needing to know
@@ -19,24 +26,18 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from ..config import OUTPUT_DIR, Settings
 from .audio_analysis import AudioFeatures, analyze_audio
 from .content_hints import detect_content_hints
-from .credits import write_credits_file
 from .local_media import scan_local_media_dir
-from .media_fetcher import download_asset, search_media
 from .mood import MoodProfile, classify_mood
 from .shot_planner import Shot, plan_shots
 from .transcribe import TranscriptResult, transcribe_audio
-from .user_media import scan_user_media
 from .video_builder import assemble_video
-from .wikimedia_fetcher import WikimediaAsset
-from .wikimedia_fetcher import download_asset as download_wikimedia_asset
-from .wikimedia_fetcher import search_wikimedia
 
 log = logging.getLogger(__name__)
 
@@ -51,31 +52,12 @@ class PipelineResult:
     transcript: TranscriptResult
     shots: list[Shot]
     render_seconds: float
-    used_stock_media_count: int = 0
-    used_procedural_count: int = 0
-    # Shots that used a file the user placed in their own
-    # USER_MEDIA_DIR/<deity>/ folder (see user_media.py) -- these take
-    # priority over Wikimedia/Pexels/Pixabay for every shot in a song
-    # once any such file is found, so this is typically either 0 (no
-    # user media supplied / no deity detected) or equal to the shot count.
-    used_user_media_count: int = 0
-    # Shots that used a file from the permanent local-only-media folder
-    # (see local_media.py / Settings.local_media_dir) -- unlike
-    # used_user_media_count above (which only ever applies to devotional
-    # songs with a recognized deity), this can be non-zero for ANY song
-    # once the user has configured a local_media_dir, since that's a
-    # global, always-on, permanent switch rather than a per-deity one.
+    # Shots that used a file from the user's local media folder (see
+    # local_media.py / Settings.local_media_dir).
     used_local_media_count: int = 0
-    # Wikimedia Commons assets actually used in the render, if any --
-    # these carry a CC-BY-SA-style attribution requirement that
-    # Pexels/Pixabay assets don't, so they're tracked separately for
-    # building a credits list (see credits.py).
-    wikimedia_assets_used: list[WikimediaAsset] = field(default_factory=list)
-    # Path to the auto-written `<video>_credits.txt` attribution file, if
-    # `wikimedia_assets_used` was non-empty -- None when no Wikimedia
-    # media was used (the common case), matching pre-feature behavior of
-    # producing no extra output file.
-    credits_file_path: str | None = None
+    # Shots that had no local media available and used a procedurally
+    # generated background instead (see procedural_visuals.py).
+    used_procedural_count: int = 0
 
 
 def _noop_progress(fraction: float, message: str) -> None:
@@ -88,192 +70,37 @@ def _default_output_path(audio_path: str) -> str:
     return str(OUTPUT_DIR / f"{stem}_{ts}.mp4")
 
 
-def _make_combined_round_robin_resolver(assets: list, kind_prefix: str):
-    """Build a `resolve(query, prefer_video) -> (local_path, kind)` closure
-    that ignores both `query` AND `prefer_video`, and simply cycles
+def _make_local_media_resolver(assets: list):
+    """Build a `resolve() -> (local_path, kind)` closure that cycles
     through ALL of `assets` (images and videos together, in the order
-    `assets` was given) round-robin, tagging each with
-    `f"{kind_prefix}_{asset.kind}"`.
+    `assets` was given) round-robin.
 
-    Shared by both `_make_user_media_resolver` (deity-specific folder)
-    and `_make_local_media_resolver` (permanent local-only-media folder)
-    below -- both need identical mixing behavior, just a different
-    `kind_prefix` ("user" vs "local") so `video_builder.build_shot_clip`
-    can still tell the two sources apart in `PipelineResult` counts/logs.
+    Every supplied file gets an equal turn in the rotation regardless of
+    kind, so a folder containing both images and videos genuinely mixes
+    both into the final video (an earlier version of this logic
+    partitioned assets into separate image/video pools and always
+    preferred video when any was present, which silently starved out any
+    supplied photos -- confirmed via a real render showing 100% video
+    content; fixed by removing that partitioning entirely).
 
-    BUG this fixes (found via real end-to-end testing of the local-only
-    mode with one supplied photo AND one supplied video): an earlier
-    version of this logic partitioned `assets` into separate image/video
-    pools and picked whichever pool `prefer_video` favored *every single
-    time that pool was non-empty* -- since `Shot.prefer_video` defaults
-    to `True` for every shot (see `shot_planner.plan_shots`), and a video
-    pool with even one item is never "empty", this meant a supplied video
-    was picked for 100% of shots and any supplied photos were **never
-    used at all**, no matter how many were supplied. Confirmed via a real
-    render: with one test photo + one test video, a contact-sheet of the
-    rendered output showed the video's content in every single frame and
-    the photo nowhere. The fix here removes that per-kind partitioning
-    entirely -- every supplied file (image or video) gets an equal turn
-    in the rotation, so a folder with both types genuinely mixes both
-    into the final video instead of one type silently starving the other.
+    Returned `kind` is `"local_image"` / `"local_video"` so
+    `video_builder.build_shot_clip` applies the extra treatment meant for
+    the user's own media: a glow/sparkle VFX overlay on stills, and a
+    short randomized (2-4 second) trim for video excerpts.
     """
     if not assets:
-        def resolve_empty(query: str, prefer_video: bool) -> tuple[str | None, str]:
+        def resolve_empty() -> tuple[str | None, str]:
             return None, "procedural"
         return resolve_empty
 
     index = {"i": 0}
 
-    def resolve(query: str, prefer_video: bool) -> tuple[str | None, str]:
+    def resolve() -> tuple[str | None, str]:
         i = index["i"] % len(assets)
         index["i"] += 1
         asset = assets[i]
-        return asset.local_path, f"{kind_prefix}_{asset.kind}"
+        return asset.local_path, f"local_{asset.kind}"
 
-    return resolve
-
-
-def _make_user_media_resolver(assets: list):
-    """Build a `resolve(query, prefer_video) -> (local_path, kind)` closure
-    for the caller's own supplied photos/videos for the song's detected
-    deity (see `user_media.scan_user_media`).
-
-    Ignores `query` entirely (deliberate: once a user has supplied their
-    own footage of the actual subject, every shot in the song should use
-    it, not just the shots whose keyword happens to match a deity term --
-    see this module's docstring / the PR description for why the old
-    deity-keyword-only routing still left several shots looking
-    unrelated) and cycles through every supplied image/video equally --
-    see `_make_combined_round_robin_resolver`'s docstring for why it
-    doesn't partition by kind or honor `prefer_video` as a hard filter.
-
-    Returned `kind` is `"user_image"` / `"user_video"` (not the plain
-    `"image"` / `"video"` used for Wikimedia/Pexels/Pixabay) so
-    `video_builder.build_shot_clip` can apply the extra treatment meant
-    specifically for user-supplied media: a subtle animated VFX overlay
-    on stills, and a short randomized trim for video excerpts so a small
-    set of clips still looks varied across many shots. See
-    video_builder.py's `build_shot_clip` docstring.
-    """
-    return _make_combined_round_robin_resolver(assets, kind_prefix="user")
-
-
-def _make_local_media_resolver(assets: list):
-    """Build a `resolve(query, prefer_video) -> (local_path, kind)` closure
-    for the permanent local-only-media folder (see `local_media.py` /
-    `Settings.local_media_dir`).
-
-    Identical mixing behavior to `_make_user_media_resolver` above (see
-    `_make_combined_round_robin_resolver`'s docstring) -- the only
-    difference is the returned `kind` string: `"local_image"` /
-    `"local_video"` instead of `"user_image"` / `"user_video"`, so
-    `video_builder.build_shot_clip` can still apply the same VFX-overlay/
-    short-trim treatment (it checks for both kind families -- see that
-    function's docstring) while keeping the two media sources
-    distinguishable in `PipelineResult` counts and logs.
-    """
-    return _make_combined_round_robin_resolver(assets, kind_prefix="local")
-
-
-def _make_shot_media_resolver(settings: Settings, deity_queries: frozenset[str] = frozenset()):
-    """Build a per-run `resolve(query, prefer_video) -> (local_path, kind)`
-    closure that caches search results per (query, prefer_video) pair and
-    round-robins through the downloaded candidates on repeat calls for
-    the same query.
-
-    Why the caching exists: `shot_planner.plan_shots` deliberately cycles
-    through a short list of keywords (mood-derived or, since the
-    devotional-theme fix, content-derived) across every shot -- a
-    6-minute track easily reuses each of ~6-8 keywords 15-30+ times.
-    Searching *and downloading* fresh on every single one of those
-    repeats was measured in practice to (a) add one full network
-    round-trip per shot to the render time, and (b) trigger Pexels' rate
-    limiting (HTTP 429) partway through a long track, since a single
-    search call is issued per repeat instead of once per unique keyword.
-
-    The fix here searches once per unique (query, prefer_video) pair,
-    downloads up to a handful of the results up front, and then serves
-    every repeat of that same query by cycling through the small set of
-    already-downloaded local files -- so a long track's many shots for
-    the same keyword still get some visual variety (not literally the
-    same single clip repeated), while collapsing what used to be N search
-    API calls (N = how many shots share that keyword) down to 1.
-
-    `deity_queries`, if given (see `content_hints.ContentHints.
-    deity_search_terms`), names the subset of queries that should try
-    Wikimedia Commons *first* -- Wikimedia has real, specific coverage of
-    named deities that Pexels/Pixabay simply don't (searching "Khatu
-    Shyam" on either returns nothing), so for exactly these queries we
-    check Wikimedia before falling back to the normal Pexels/Pixabay
-    flow. Generic mood/devotional keywords ("hindu temple", "diya lamp",
-    ...) are NOT in this set and go straight to Pexels/Pixabay as before
-    -- Wikimedia's search quality for broad, generic terms is noisier
-    (it's an encyclopedia, not a stock-photo library) and untested at
-    that scale, so this integration is deliberately scoped to only the
-    specific, verified-good case: named-deity queries.
-    """
-    search_cache: dict[tuple[str, bool], list] = {}
-    cycle_index: dict[tuple[str, bool], int] = {}
-    max_downloads_per_query = 4
-    # Every distinct Wikimedia asset actually downloaded during this run,
-    # in first-use order -- exposed as `resolve.wikimedia_assets_used`
-    # after the caller is done, for building the CC-BY-SA attribution/
-    # credits list (see credits.py). Pexels/Pixabay assets don't require
-    # attribution under their license terms, so only Wikimedia ones are
-    # tracked here.
-    wikimedia_assets_used: list[WikimediaAsset] = []
-    _seen_wikimedia_urls: set[str] = set()
-
-    def _download_wikimedia_candidates(query: str, prefer_video: bool) -> list[WikimediaAsset]:
-        downloaded: list[WikimediaAsset] = []
-        kinds = ["video", "image"] if prefer_video else ["image", "video"]
-        for kind in kinds:
-            if len(downloaded) >= max_downloads_per_query:
-                break
-            for asset in search_wikimedia(query, kind=kind):
-                if len(downloaded) >= max_downloads_per_query:
-                    break
-                if download_wikimedia_asset(asset):
-                    downloaded.append(asset)
-                    if asset.url not in _seen_wikimedia_urls:
-                        _seen_wikimedia_urls.add(asset.url)
-                        wikimedia_assets_used.append(asset)
-        return downloaded
-
-    def resolve(query: str, prefer_video: bool) -> tuple[str | None, str]:
-        cache_key = (query, prefer_video)
-
-        if cache_key not in search_cache:
-            downloaded: list = []
-            if query in deity_queries and settings.use_wikimedia:
-                downloaded = _download_wikimedia_candidates(query, prefer_video)
-                if downloaded:
-                    log.info(
-                        "Wikimedia Commons: found %d asset(s) for deity query %r",
-                        len(downloaded), query,
-                    )
-
-            if not downloaded:
-                candidates = search_media(query, settings, prefer_video=prefer_video)
-                for asset in candidates:
-                    if len(downloaded) >= max_downloads_per_query:
-                        break
-                    if download_asset(asset):
-                        downloaded.append(asset)
-
-            search_cache[cache_key] = downloaded
-            cycle_index[cache_key] = 0
-
-        downloaded = search_cache[cache_key]
-        if not downloaded:
-            return None, "procedural"
-
-        idx = cycle_index[cache_key] % len(downloaded)
-        cycle_index[cache_key] += 1
-        asset = downloaded[idx]
-        return asset.local_path, asset.kind
-
-    resolve.wikimedia_assets_used = wikimedia_assets_used
     return resolve
 
 
@@ -292,8 +119,7 @@ def run_pipeline(
 
     `cancel_check()` — if provided and returns True, the pipeline raises
     `PipelineCancelled` at the next safe checkpoint (between stages / between
-    shots) instead of continuing. Partial downloads already on disk are left
-    in the cache for reuse by a future run.
+    shots) instead of continuing.
     """
     settings = settings or Settings.load()
     progress_cb = progress_cb or _noop_progress
@@ -332,152 +158,70 @@ def run_pipeline(
     check_cancel()
 
     # --- Stage 4: shot planning (32% - 38%) ---------------------------------
-    # Detect a content-level theme (currently: devotional/spiritual) from
-    # the filename plus any transcribed lyrics, so shots can be given
-    # keywords that actually relate to the song's subject matter instead
-    # of only the acoustic mood's generic tempo/loudness-based ones. See
-    # content_hints.py's module docstring for why the filename is checked
-    # at all (it's the single most reliable free signal for song *topic*).
+    # Detect a devotional/spiritual theme from the filename plus any
+    # transcribed lyrics, purely to slow shot pacing to something more
+    # contemplative than the acoustic mood classifier alone would pick
+    # (see content_hints.py's module docstring).
     content_hints = detect_content_hints(Path(audio_path).name, transcript.full_text)
+    if content_hints.is_devotional:
+        report(
+            0.33,
+            f"Devotional/spiritual theme detected ({', '.join(content_hints.matched_terms[:3])}) "
+            "— using slower, more contemplative pacing.",
+        )
 
-    # The permanent local-only-media switch (Settings.local_media_dir) is
-    # checked FIRST and takes absolute priority over everything below --
-    # deity detection, Wikimedia, Pexels/Pixabay, and the deity-specific
-    # user_media.py folder are ALL skipped entirely once this is set, for
-    # every song (not just devotional ones), per the user's explicit
-    # request for a single, simple, permanent "only ever use my own
-    # local folder" switch. Unlike user_media.py's per-deity behavior,
-    # an empty local_media_dir folder does NOT fall back to any online
-    # source -- see local_media.py's module docstring for why.
-    local_only_mode = bool(settings.local_media_dir)
-    local_media_assets: list = []
-    user_media_assets: list = []
-
-    if local_only_mode:
-        local_media_assets = scan_local_media_dir(settings.local_media_dir)
+    # Scan the user's local media folder now (before shot planning) purely
+    # so the progress log can report whether it found anything before the
+    # per-shot fetch loop starts.
+    local_media_assets = scan_local_media_dir(settings.local_media_dir) if settings.local_media_dir else []
+    if settings.local_media_dir:
         if local_media_assets:
             kinds_summary = (
                 f"{sum(1 for a in local_media_assets if a.kind == 'video')} video(s), "
                 f"{sum(1 for a in local_media_assets if a.kind == 'image')} photo(s)"
             )
-            report(
-                0.33,
-                f"Local-only media mode: using your own files ({kinds_summary}) for every shot "
-                f"— online sources (Wikimedia/Pexels/Pixabay) are disabled.",
-            )
+            report(0.335, f"Using your local media folder ({kinds_summary}) for every shot.")
         else:
             report(
-                0.33,
-                f"Local-only media mode: no image/video files found in {settings.local_media_dir} "
-                "— shots will use generated visuals (online sources remain disabled).",
+                0.335,
+                f"No image/video files found in {settings.local_media_dir} "
+                "— shots will use generated visuals.",
             )
     else:
-        if content_hints.is_devotional:
-            report(
-                0.33,
-                f"Devotional/spiritual theme detected ({', '.join(content_hints.matched_terms[:3])}) "
-                "— using matching visuals.",
-            )
-        # If the user has placed their own photos/videos of this deity
-        # under USER_MEDIA_DIR (see user_media.py), those take priority --
-        # every shot in the song uses them, bypassing Wikimedia/Pexels/
-        # Pixabay/procedural entirely, since the user has explicitly
-        # supplied footage of the actual subject. Checked before deciding
-        # whether to even mention Wikimedia in the progress log, so the
-        # messaging is accurate about which source is actually used.
-        user_media_assets = scan_user_media(content_hints.deity) if content_hints.deity else []
-
-        if user_media_assets:
-            kinds_summary = f"{sum(1 for a in user_media_assets if a.kind == 'video')} video(s), {sum(1 for a in user_media_assets if a.kind == 'image')} photo(s)"
-            report(
-                0.335,
-                f"Using your own {content_hints.deity} media ({kinds_summary}) for every shot.",
-            )
-        elif content_hints.deity:
-            report(0.335, f"Specific deity detected: {content_hints.deity} — checking Wikimedia Commons for real footage.")
-
-    # When a specific deity was identified, put its Wikimedia-tuned search
-    # terms *ahead of* the generic devotional keywords in the cycle shots
-    # draw from -- this biases most shots toward the actual named subject
-    # (e.g. "Khatu Shyam") while still mixing in generic devotional
-    # visuals (temple/diya/prayer) for variety across a long track. This
-    # keyword list is still passed to plan_shots() even when user_media_assets
-    # is non-empty (it drives the progress-log "fetching visuals for X"
-    # message and stays available if the user later empties the folder),
-    # but the resolver built below ignores it entirely in that case.
-    # In local-only mode, content_hints/deity detection was skipped
-    # entirely above, so there's nothing deity-specific to bias toward --
-    # shots simply use whatever keyword the mood classifier would have
-    # picked anyway (content_keywords=None), since the local-media
-    # resolver ignores shot keywords completely regardless.
-    combined_keywords = None if local_only_mode else ((content_hints.deity_search_terms + content_hints.keywords) or None)
+        report(0.335, "No local media folder configured — shots will use generated visuals.")
 
     report(0.34, "Planning beat-synced shots...")
     shots = plan_shots(
-        features, mood, transcript=transcript, prefer_video_clips=settings.prefer_video_clips,
-        content_keywords=combined_keywords,
-        cut_speed_multiplier=None if local_only_mode else content_hints.cut_speed_multiplier,
-        # Devotional lyrics ("tera", "karo", "jai", "kalyan", ...) are
-        # invocation/grammar words, not visual descriptions -- if a
-        # devotional song has clear vocals, transcribed lyric keywords
-        # would otherwise silently override the correctly-detected
-        # devotional/deity keywords for almost every shot (see
-        # shot_planner.plan_shots' docstring). Only devotional content
-        # flips this priority; ordinary songs still prefer their own
-        # (often genuinely descriptive) lyric keywords as before. Never
-        # applies in local-only mode (content_hints wasn't consulted).
-        prioritize_content_keywords=(not local_only_mode) and content_hints.is_devotional,
+        features, mood, transcript=transcript,
+        cut_speed_multiplier=content_hints.cut_speed_multiplier,
     )
     report(0.38, f"Planned {len(shots)} shots.")
     check_cancel()
 
-    # --- Stage 5: fetch stock media per shot (38% - 70%) --------------------
+    # --- Stage 5: resolve media per shot (38% - 70%) ------------------------
     resolved_media: dict[int, tuple[str | None, str]] = {}
-    stock_count = 0
-    procedural_count = 0
-    user_media_count = 0
     local_media_count = 0
+    procedural_count = 0
     fetch_span = 0.32  # 38% -> 70%
-    if local_only_mode:
-        # Permanent switch -- never touches Wikimedia/Pexels/Pixabay/
-        # user_media.py, even when local_media_assets is empty (that case
-        # is handled naturally below: resolve() returns (None,
-        # "procedural") for every shot, exactly like "no stock media
-        # available" already does elsewhere in this app).
-        resolve_media_for_shot = _make_local_media_resolver(local_media_assets)
-    elif user_media_assets:
-        resolve_media_for_shot = _make_user_media_resolver(user_media_assets)
-    else:
-        resolve_media_for_shot = _make_shot_media_resolver(
-            settings, deity_queries=frozenset(content_hints.deity_search_terms)
-        )
+    resolve_media_for_shot = _make_local_media_resolver(local_media_assets)
     for i, shot in enumerate(shots):
         check_cancel()
-        query = shot.keywords[0] if shot.keywords else mood.keywords[0]
         report(
             0.38 + fetch_span * (i / max(1, len(shots))),
-            f"Fetching visuals for shot {i + 1}/{len(shots)} ({query})...",
+            f"Resolving visuals for shot {i + 1}/{len(shots)}...",
         )
-        local_path, kind = resolve_media_for_shot(query, shot.prefer_video)
-        if local_path and kind in ("local_image", "local_video"):
+        local_path, kind = resolve_media_for_shot()
+        if local_path:
             resolved_media[shot.index] = (local_path, kind)
             local_media_count += 1
-        elif local_path and kind in ("user_image", "user_video"):
-            resolved_media[shot.index] = (local_path, kind)
-            user_media_count += 1
-        elif local_path:
-            resolved_media[shot.index] = (local_path, kind)
-            stock_count += 1
         else:
             resolved_media[shot.index] = (None, "procedural")
             procedural_count += 1
 
     if local_media_count:
-        report(0.70, f"Visuals resolved: {local_media_count} from your local media folder.")
-    elif user_media_count:
-        report(0.70, f"Visuals resolved: {user_media_count} from your own media.")
+        report(0.70, f"Visuals resolved: {local_media_count} from your local media folder, {procedural_count} generated.")
     else:
-        report(0.70, f"Visuals resolved: {stock_count} from stock, {procedural_count} generated.")
+        report(0.70, f"Visuals resolved: {procedural_count} generated (no local media configured).")
     check_cancel()
 
     # --- Stage 6: render final video (70% - 100%) ---------------------------
@@ -500,23 +244,7 @@ def run_pipeline(
         progress_cb=render_progress,
     )
     render_seconds = time.time() - start
-
-    # If any Wikimedia Commons media was used, write its CC-license
-    # attribution alongside the video -- see credits.py's module
-    # docstring for why this is required (Wikimedia media, unlike
-    # Pexels/Pixabay, is almost always attribution-licensed). A no-op
-    # (returns None, writes nothing) when the list is empty, which is the
-    # common case for renders that never matched a specific named deity.
-    # The user-media resolver (used when the user supplied their own
-    # files) has no such attribute at all -- the user's own media needs
-    # no Wikimedia-style attribution tracking, so this is simply skipped
-    # in that case.
-    wikimedia_assets_used = getattr(resolve_media_for_shot, "wikimedia_assets_used", [])
-    credits_file_path = write_credits_file(wikimedia_assets_used, final_path)
-    if credits_file_path:
-        report(1.0, f"Done! Saved to {final_path} (see {Path(credits_file_path).name} for media credits)")
-    else:
-        report(1.0, f"Done! Saved to {final_path}")
+    report(1.0, f"Done! Saved to {final_path}")
 
     return PipelineResult(
         output_path=final_path,
@@ -525,12 +253,8 @@ def run_pipeline(
         transcript=transcript,
         shots=shots,
         render_seconds=render_seconds,
-        used_stock_media_count=stock_count,
-        used_procedural_count=procedural_count,
-        used_user_media_count=user_media_count,
         used_local_media_count=local_media_count,
-        wikimedia_assets_used=wikimedia_assets_used,
-        credits_file_path=credits_file_path,
+        used_procedural_count=procedural_count,
     )
 
 

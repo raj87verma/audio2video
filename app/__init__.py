@@ -1,10 +1,10 @@
 """Audio2Video — turn an audio file into an auto-assembled video.
 
-Built entirely on free / open-source tooling:
+Built entirely on free / open-source tooling, with NO online media
+sources of any kind:
   - librosa            : audio analysis (tempo, beats, energy)
   - faster-whisper      : optional local speech-to-text (no API key, no cost)
-  - Pexels / Pixabay    : free stock photo & video APIs (require free API keys)
-  - Freesound           : optional free sound-effect API (requires free API key)
+  - local media folder  : the user's own photos/videos (see local_media.py)
   - MoviePy / FFmpeg    : video assembly and rendering
   - PySide6             : desktop GUI
 """

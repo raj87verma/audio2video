@@ -1,78 +1,39 @@
-"""Central configuration: paths, cache locations and API keys.
+"""Central configuration: paths and settings.
 
-All third-party services used here have a FREE tier that only requires a
-free sign-up (no credit card):
-
-  - Pexels    : https://www.pexels.com/api/            (free, generous limits)
-  - Pixabay   : https://pixabay.com/api/docs/           (free, generous limits)
-  - Freesound : https://freesound.org/docs/api/         (free, optional, for SFX)
-
-If no keys are configured the app still works end-to-end: it falls back to
-procedurally generated visuals (gradient/particle backgrounds synced to the
-music) and synthetic, numpy-generated sound effects, so nothing ever hard
-fails just because a key is missing.
+Audio2Video uses NO online media sources of any kind for visuals -- every
+shot's visual either comes from a folder of the user's own photos/videos
+(see `local_media.py`), or is procedurally generated locally
+(`procedural_visuals.py`). Nothing here ever calls out to the internet
+for images or video.
 """
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("AUDIO2VIDEO_HOME", Path.home() / ".audio2video"))
-CACHE_DIR = DATA_DIR / "cache"
-MEDIA_CACHE_DIR = CACHE_DIR / "media"
-SFX_CACHE_DIR = CACHE_DIR / "sfx"
 OUTPUT_DIR = DATA_DIR / "output"
 SETTINGS_FILE = DATA_DIR / "settings.json"
-# Where a user can drop their own royalty-free deity photos/videos (e.g.
-# their own Khatu Shyam clips) so the app uses those FIRST -- ahead of
-# Wikimedia/Pexels/Pixabay -- for every shot in a song about that deity.
-# See user_media.py for the per-deity subfolder layout this contains.
-USER_MEDIA_DIR = DATA_DIR / "user_media"
 
-for _d in (DATA_DIR, CACHE_DIR, MEDIA_CACHE_DIR, SFX_CACHE_DIR, OUTPUT_DIR, USER_MEDIA_DIR):
+for _d in (DATA_DIR, OUTPUT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
 class Settings:
-    pexels_api_key: str = ""
-    pixabay_api_key: str = ""
-    freesound_api_key: str = ""
     whisper_model_size: str = "base"  # tiny/base/small/medium
     use_speech_to_text: bool = True
     target_resolution: str = "1080p"  # 720p / 1080p / 4k
     fps: int = 30
-    prefer_video_clips: bool = True  # prefer stock video over still images when available
-    # Wikimedia Commons needs no API key/sign-up (unlike Pexels/Pixabay)
-    # and is only ever consulted for a *specific* detected deity/entity
-    # (see content_hints.py) -- generic devotional/mood keywords still go
-    # to Pexels/Pixabay as usual. Defaults on since it requires no setup
-    # and only activates for a narrow, deliberately-targeted query type;
-    # can be turned off for users who'd rather skip an extra network
-    # source or who have attribution concerns (Wikimedia media is
-    # typically CC BY-SA, which requires crediting the author -- see the
-    # auto-generated credits file this produces).
-    use_wikimedia: bool = True
-    # Absolute path to a user-chosen folder (containing `images/` and
-    # `videos/` subfolders -- see local_media.py) that, once set,
-    # PERMANENTLY replaces every online media source (Wikimedia, Pexels,
-    # Pixabay) for every song -- not just devotional/deity ones. This is
-    # a stronger, simpler alternative to the deity-specific
-    # `user_media.py` mechanism: that one only activates for songs where
-    # a specific deity is detected and still falls back online if its
-    # per-deity folder happens to be empty; this one is an explicit,
-    # global, all-or-nothing switch the user opts into deliberately via
-    # Settings, and never calls out to the internet for visuals at all
-    # once set, regardless of song content or whether the folder
-    # currently has any usable files in it (see local_media.py's module
-    # docstring and pipeline.py's use of it for the exact no-fallback
-    # behavior this implies). Empty string means "not set" -- i.e. use
-    # the existing Wikimedia/Pexels/Pixabay/user_media behavior as before.
+    # Absolute path to a folder (containing `images/` and `videos/`
+    # subfolders -- see local_media.py) of the user's own photos/videos.
+    # Empty string means "not set" -- every shot then uses procedurally
+    # generated visuals instead. This is the ONLY visual media source
+    # Audio2Video has; there is no online fallback of any kind.
     local_media_dir: str = ""
-    extra: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -83,12 +44,7 @@ class Settings:
                 return cls(**known)
             except Exception:
                 pass
-        # Fall back to environment variables (useful for CLI / CI usage)
-        return cls(
-            pexels_api_key=os.environ.get("PEXELS_API_KEY", ""),
-            pixabay_api_key=os.environ.get("PIXABAY_API_KEY", ""),
-            freesound_api_key=os.environ.get("FREESOUND_API_KEY", ""),
-        )
+        return cls()
 
     def save(self) -> None:
         SETTINGS_FILE.write_text(json.dumps(asdict(self), indent=2))

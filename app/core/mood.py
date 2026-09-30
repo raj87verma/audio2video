@@ -14,7 +14,8 @@ The classifier looks at:
 
 Moods map to:
   - a human-readable label (shown in the UI)
-  - stock-media search keywords (fed to Pexels/Pixabay)
+  - keywords (cosmetic only -- shown in the progress log; Audio2Video has
+    no online media search to route them to, see local_media.py)
   - a color-grading preset (used by the video builder)
   - a cut-speed multiplier (shorter shots for high energy moods)
 """

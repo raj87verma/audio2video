@@ -1,11 +1,11 @@
 """Procedural fallback visuals — generated entirely with PIL + numpy.
 
-Used whenever a shot's stock-media search (Pexels/Pixabay) comes back
-empty — no API key configured, rate-limited, no results for the keyword,
-or a network hiccup. This guarantees the pipeline can ALWAYS produce a
-finished video, even completely offline with zero API keys, by rendering
-mood-colored animated gradient/particle backgrounds plus a live audio
-waveform/spectrum readout synced to the music.
+Used whenever a shot has no local media available (see `local_media.py`)
+-- no folder configured, folder empty, or that shot's turn in the
+round-robin ran out of files. This guarantees the pipeline can ALWAYS
+produce a finished video, completely offline, by rendering mood-colored
+animated gradient/particle backgrounds plus a live audio waveform/
+spectrum readout synced to the music.
 
 Everything here is deterministic-ish (seeded by shot index) so re-runs of
 the same project look consistent, and cheap enough to generate per-frame
