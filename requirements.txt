@@ -20,9 +20,6 @@ opencv-python-headless
 # Speech-to-text (optional, runs fully offline/local, free & open source)
 faster-whisper
 
-# HTTP client for free stock media APIs (Pexels, Pixabay, Freesound)
-requests
-
 # Desktop GUI
 PySide6
 

@@ -1,18 +1,9 @@
-"""Sound-effect generation and fetching.
+"""Sound-effect generation.
 
-Two sources, combined:
-
-  1. Synthetic SFX (always available, zero dependencies beyond numpy) —
-     procedurally generated whoosh / impact / riser / sparkle sounds used
-     as beat-synced transition and highlight cues. These are what give the
-     final video its "SFX added automatically" feel even with zero API
-     keys and zero network access.
-
-  2. Freesound (optional, free API key, https://freesound.org/docs/api/) —
-     when configured, lets the pipeline pull a real, keyword-matched sound
-     effect (e.g. "rain", "applause", "explosion") for shots whose lyrics
-     or mood keywords suggest a concrete sound. Falls back to synthetic
-     SFX for any keyword that doesn't return a usable result.
+Procedurally generated whoosh / impact / riser / sparkle sounds (numpy
+only, zero network access) used as beat-synced transition and highlight
+cues. These are what give the final video its "SFX added automatically"
+feel entirely offline.
 
 All synthesized effects are returned as float32 numpy arrays (mono, at the
 given sample rate) so the video builder can mix them directly with
@@ -20,16 +11,7 @@ MoviePy's AudioArrayClip without needing any file I/O.
 """
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
-
 import numpy as np
-import requests
-
-log = logging.getLogger(__name__)
-
-REQUEST_TIMEOUT = 15
-USER_AGENT = "Audio2Video/0.1 free-sfx-client"
 
 # ---------------------------------------------------------------------------
 # Synthetic SFX generators
@@ -153,70 +135,3 @@ def synth_sfx_for(energy_level: str, purpose: str, sr: int = 44100) -> np.ndarra
     if factory is None:
         factory = lambda sr: generate_whoosh(0.5, sr)
     return factory(sr)
-
-
-# ---------------------------------------------------------------------------
-# Freesound (optional, free API key) keyword-matched SFX
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FreesoundHit:
-    id: int
-    name: str
-    preview_url: str
-    duration: float
-
-
-def search_freesound(query: str, api_key: str, max_results: int = 5) -> list[FreesoundHit]:
-    """Search Freesound for short, free-to-use sound effects matching `query`.
-
-    Requires a free Freesound API token (https://freesound.org/apiv2/apply/).
-    Returns [] on any error so callers can seamlessly fall back to synthetic
-    SFX without special-casing failures.
-    """
-    if not api_key:
-        return []
-    try:
-        resp = requests.get(
-            "https://freesound.org/apiv2/search/text/",
-            params={
-                "query": query,
-                "token": api_key,
-                "fields": "id,name,previews,duration",
-                "filter": "duration:[0.1 TO 6]",
-                "page_size": max_results,
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        hits = []
-        for item in data.get("results", []):
-            previews = item.get("previews", {})
-            url = previews.get("preview-hq-mp3") or previews.get("preview-lq-mp3")
-            if not url:
-                continue
-            hits.append(FreesoundHit(
-                id=item["id"], name=item.get("name", query),
-                preview_url=url, duration=float(item.get("duration", 1.0)),
-            ))
-        return hits
-    except Exception as exc:
-        log.warning("Freesound search failed for %r: %s", query, exc)
-        return []
-
-
-def download_freesound_preview(hit: FreesoundHit, dest_path: str) -> str | None:
-    try:
-        with requests.get(hit.preview_url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=30) as resp:
-            resp.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1 << 16):
-                    if chunk:
-                        f.write(chunk)
-        return dest_path
-    except Exception as exc:
-        log.warning("Failed to download Freesound preview %r: %s", hit.name, exc)
-        return None
