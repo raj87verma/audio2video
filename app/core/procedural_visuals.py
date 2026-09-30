@@ -131,6 +131,86 @@ def render_waveform_bars(
     return overlay
 
 
+def _draw_sparkles(draw: ImageDraw.ImageDraw, width: int, height: int, t: float, seed: int, count: int = 22):
+    """Small bright twinkling points, distinct from `_draw_particles`
+    (which drifts uniformly across the frame): sparkles stay near a fixed
+    position and pulse in/out of visibility, closer to how light glinting
+    off a photo/frame/jewelry would look than drifting dust motes.
+    """
+    rng = random.Random(seed + 9973)  # offset so this doesn't reuse the exact same draws as _draw_particles
+    for i in range(count):
+        base_x = rng.uniform(0, width)
+        base_y = rng.uniform(0, height)
+        # Each sparkle twinkles on its own phase/speed so they don't all
+        # pulse in unison.
+        phase = rng.uniform(0, math.tau)
+        speed = rng.uniform(1.2, 2.6)
+        twinkle = (math.sin(t * speed + phase) + 1) / 2  # 0..1
+        if twinkle < 0.35:
+            continue  # mostly invisible; only flash brightly some of the time
+        radius = rng.uniform(1.5, 4.0) * twinkle
+        alpha = int(180 * twinkle)
+        draw.ellipse(
+            [base_x - radius, base_y - radius, base_x + radius, base_y + radius],
+            fill=(255, 255, 235, alpha),
+        )
+        # A thin cross-flare through the sparkle's center reads as a
+        # "glint" rather than a plain dot at a glance.
+        flare = radius * 2.5
+        draw.line([base_x - flare, base_y, base_x + flare, base_y], fill=(255, 255, 235, alpha // 2), width=1)
+        draw.line([base_x, base_y - flare, base_x, base_y + flare], fill=(255, 255, 235, alpha // 2), width=1)
+
+
+def render_glow_sparkle_overlay(width: int, height: int, t: float, seed: int = 0) -> Image.Image:
+    """Transparent RGBA overlay: a soft vignette-style glow pulsing at the
+    frame edges plus a handful of twinkling sparkle points (see
+    `_draw_sparkles`).
+
+    Meant to be alpha-composited on top of an otherwise-static Ken Burns
+    still-image frame (see `video_builder.build_image_shot_clip`'s
+    `add_vfx_overlay` parameter) to give a user's own supplied photo a bit
+    of the same "alive" animated quality that stock video and the
+    procedural fallback already have, without altering the photo's own
+    color grading/exposure (this overlay only ever adds soft white light,
+    never darkens or recolors the base image).
+    """
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
+    # Soft pulsing glow: a low-resolution radial gradient (cheap to
+    # compute, then upscaled+blurred -- same trick render_gradient_frame
+    # uses for its diagonal gradient) brightening and dimming slowly.
+    small = 48
+    yy, xx = np.mgrid[0:small, 0:small].astype(np.float32)
+    cx, cy = small / 2, small / 2
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / (small / 2)
+    pulse = 0.5 + 0.5 * math.sin(t * 0.6 + seed)
+    glow_strength = 40 + 30 * pulse  # peak alpha near frame edges
+    alpha_small = np.clip(dist, 0, 1) * glow_strength
+    glow_rgba = np.zeros((small, small, 4), dtype=np.uint8)
+    glow_rgba[..., 0:3] = 255
+    glow_rgba[..., 3] = alpha_small.astype(np.uint8)
+    glow_img = Image.fromarray(glow_rgba, mode="RGBA").resize((width, height), Image.BICUBIC)
+    glow_img = glow_img.filter(ImageFilter.GaussianBlur(radius=max(width, height) * 0.02))
+    overlay.alpha_composite(glow_img)
+
+    draw = ImageDraw.Draw(overlay)
+    _draw_sparkles(draw, width, height, t, seed)
+    return overlay
+
+
+def render_glow_sparkle_overlay_onto(frame: np.ndarray, t: float, seed: int = 0) -> np.ndarray:
+    """Convenience wrapper: alpha-composite `render_glow_sparkle_overlay`
+    onto an existing opaque RGB numpy frame and return a numpy RGB frame
+    (i.e. does the PIL<->numpy conversion so `video_builder` call sites
+    can stay in pure-numpy `make_frame` functions, matching every other
+    frame-producing helper in this module).
+    """
+    h, w = frame.shape[0], frame.shape[1]
+    base = Image.fromarray(frame, mode="RGB").convert("RGBA")
+    base.alpha_composite(render_glow_sparkle_overlay(w, h, t, seed))
+    return np.array(base.convert("RGB"))
+
+
 def compose_procedural_frame(
     width: int,
     height: int,

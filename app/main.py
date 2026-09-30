@@ -7,6 +7,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from .config import DATA_DIR
+from .core.user_media import ensure_user_media_dirs
 from .gui.main_window import MainWindow
 
 LOG_FILE = DATA_DIR / "audio2video.log"
@@ -46,6 +47,11 @@ def _configure_logging() -> None:
 def main() -> int:
     _configure_logging()
     logging.getLogger(__name__).info("Audio2Video starting up. Log file: %s", LOG_FILE)
+    # Create the per-deity "drop your own media here" folders up front so
+    # they're ready to find/use from the very first launch, rather than
+    # only appearing the first time a matching song happens to be
+    # processed. See user_media.py for the folder layout.
+    ensure_user_media_dirs()
     app = QApplication(sys.argv)
     app.setApplicationName("Audio2Video")
     window = MainWindow()

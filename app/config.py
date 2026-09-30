@@ -26,8 +26,13 @@ MEDIA_CACHE_DIR = CACHE_DIR / "media"
 SFX_CACHE_DIR = CACHE_DIR / "sfx"
 OUTPUT_DIR = DATA_DIR / "output"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+# Where a user can drop their own royalty-free deity photos/videos (e.g.
+# their own Khatu Shyam clips) so the app uses those FIRST -- ahead of
+# Wikimedia/Pexels/Pixabay -- for every shot in a song about that deity.
+# See user_media.py for the per-deity subfolder layout this contains.
+USER_MEDIA_DIR = DATA_DIR / "user_media"
 
-for _d in (DATA_DIR, CACHE_DIR, MEDIA_CACHE_DIR, SFX_CACHE_DIR, OUTPUT_DIR):
+for _d in (DATA_DIR, CACHE_DIR, MEDIA_CACHE_DIR, SFX_CACHE_DIR, OUTPUT_DIR, USER_MEDIA_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
