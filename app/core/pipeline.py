@@ -258,6 +258,15 @@ def run_pipeline(
         features, mood, transcript=transcript, prefer_video_clips=settings.prefer_video_clips,
         content_keywords=combined_keywords,
         cut_speed_multiplier=content_hints.cut_speed_multiplier,
+        # Devotional lyrics ("tera", "karo", "jai", "kalyan", ...) are
+        # invocation/grammar words, not visual descriptions -- if a
+        # devotional song has clear vocals, transcribed lyric keywords
+        # would otherwise silently override the correctly-detected
+        # devotional/deity keywords for almost every shot (see
+        # shot_planner.plan_shots' docstring). Only devotional content
+        # flips this priority; ordinary songs still prefer their own
+        # (often genuinely descriptive) lyric keywords as before.
+        prioritize_content_keywords=content_hints.is_devotional,
     )
     report(0.38, f"Planned {len(shots)} shots.")
     check_cancel()

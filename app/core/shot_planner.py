@@ -104,6 +104,7 @@ def plan_shots(
     prefer_video_clips: bool = True,
     content_keywords: list[str] | None = None,
     cut_speed_multiplier: float | None = None,
+    prioritize_content_keywords: bool = False,
 ) -> list[Shot]:
     """Produce an ordered list of Shot objects covering the full audio duration.
 
@@ -118,6 +119,23 @@ def plan_shots(
     generic tempo/loudness-based mood keywords like "celebration" or
     "dance" that would otherwise fetch visuals with no connection to what
     the song is actually about.
+
+    `prioritize_content_keywords`, when True, flips that order so
+    `content_keywords` are tried *before* lyric-derived keywords instead
+    of after. This exists for devotional content specifically: real
+    devotional lyrics (aarti/bhajan) are overwhelmingly invocation/
+    grammar words -- "tera" (your), "karo" (do), "jai" (hail), "kalyan"
+    (welfare), "bhakto" (devotees) -- which are not visual search terms
+    and mean nothing to a stock-media API, unlike a pop song's lyrics
+    which might genuinely describe a scene ("dancing in the rain"). Left
+    at the default (lyric keywords first), a devotional song with clear
+    vocals would have its correctly-detected deity/devotional keywords
+    silently discarded in favor of these meaningless transcribed words
+    for almost every shot, sending searches for "tera"/"karo" instead of
+    "Khatu Shyam" -- defeating the entire purpose of content_hints'
+    devotional/deity detection. Non-devotional callers should leave this
+    False so genuinely useful lyric-derived keywords keep taking priority
+    as before.
     """
     target_duration = _target_shot_duration(features, mood)
     if cut_speed_multiplier:
@@ -154,15 +172,32 @@ def plan_shots(
             highlight_time = float(in_window[0])
             is_highlight = True
 
-        # Keywords: prefer lyric/vocal keywords for this window, then a
-        # content-hint override (e.g. devotional theme detected from the
-        # filename), then fall back to cycling through the mood's keyword
-        # list for visual variety.
+        # Keywords: normally prefer lyric/vocal keywords for this window,
+        # then a content-hint override (e.g. devotional theme detected
+        # from the filename), then fall back to cycling through the
+        # mood's keyword list for visual variety. When
+        # `prioritize_content_keywords` is set (devotional content -- see
+        # this function's docstring), content keywords are tried first
+        # instead, since transcribed devotional lyrics are almost never
+        # useful visual search terms.
         keywords: list[str] = []
-        if transcript is not None and transcript.has_speech:
-            keywords = transcript.keywords_in(start, end, limit=3)
-        if not keywords and content_keyword_cycle is not None:
-            keywords = [next(content_keyword_cycle)]
+        transcript_keywords_fn = (
+            (lambda: transcript.keywords_in(start, end, limit=3))
+            if transcript is not None and transcript.has_speech
+            else (lambda: [])
+        )
+        content_keywords_fn = (
+            (lambda: [next(content_keyword_cycle)]) if content_keyword_cycle is not None else (lambda: [])
+        )
+        ordered_sources = (
+            [content_keywords_fn, transcript_keywords_fn]
+            if prioritize_content_keywords
+            else [transcript_keywords_fn, content_keywords_fn]
+        )
+        for source in ordered_sources:
+            keywords = source()
+            if keywords:
+                break
         if not keywords:
             keywords = [next(mood_keyword_cycle)]
 
