@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import re
 import shutil
 import subprocess as sp
@@ -37,7 +38,7 @@ from moviepy.editor import (
 from moviepy.audio.AudioClip import AudioArrayClip
 
 from .mood import MoodProfile
-from .procedural_visuals import compose_procedural_frame
+from .procedural_visuals import compose_procedural_frame, render_glow_sparkle_overlay_onto
 from .sfx import synth_sfx_for
 from .shot_planner import Shot
 
@@ -319,8 +320,30 @@ def cover_resize_crop(clip: VideoClip, target_w: int, target_h: int) -> VideoCli
 # ---------------------------------------------------------------------------
 
 def build_image_shot_clip(
-    image_path: str, shot: Shot, target_w: int, target_h: int, fps: int, grade: str
+    image_path: str,
+    shot: Shot,
+    target_w: int,
+    target_h: int,
+    fps: int,
+    grade: str,
+    add_vfx_overlay: bool = False,
 ) -> VideoClip:
+    """Build a shot clip from a still image (Ken Burns pan/zoom + color grade).
+
+    `add_vfx_overlay`, when True, additionally composites a subtle
+    animated glow + drifting-sparkle effect on top (see
+    `procedural_visuals.render_glow_sparkle_overlay`). This is used
+    specifically for the user's own supplied deity photos (see
+    `user_media.py` / `pipeline._make_user_media_resolver`) -- a static
+    personal photo otherwise looks comparatively flat/motionless next to
+    the animated procedural-fallback shots and stock-video shots
+    elsewhere in the same render, and the user explicitly asked for
+    "animations and vfx" on their own images. Left off by default (and
+    for Wikimedia/Pexels/Pixabay images) since those already look
+    intentional as plain Ken-Burns stills and this hasn't been asked for
+    there -- keeping the default behavior byte-for-byte unchanged for
+    every already-verified code path.
+    """
     img = Image.open(image_path)
     # Apply EXIF orientation before anything else. Phone-camera photos
     # (very common among Wikimedia Commons devotional uploads -- see
@@ -336,17 +359,54 @@ def build_image_shot_clip(
         img, shot.duration, target_w, target_h, shot.zoom_direction, shot.pan_direction
     )
 
-    def make_frame(t):
-        return apply_color_grade(frame_fn(t), grade)
+    if add_vfx_overlay:
+        # Seeded by shot.index so the sparkle pattern differs shot-to-shot
+        # (a user typically has just a handful of photos reused across
+        # many shots -- an identical, unmoving overlay every single time
+        # would look obviously repetitive) while staying deterministic
+        # for a given render (re-running on the same input reproduces the
+        # same output, consistent with how every other seeded effect in
+        # this codebase behaves, e.g. build_procedural_shot_clip's seed).
+        def make_frame(t):
+            base = apply_color_grade(frame_fn(t), grade)
+            return render_glow_sparkle_overlay_onto(base, t, seed=shot.index)
+    else:
+        def make_frame(t):
+            return apply_color_grade(frame_fn(t), grade)
 
     clip = VideoClip(make_frame=make_frame, duration=shot.duration)
     return clip.set_fps(fps)
 
 
 def build_video_shot_clip(
-    video_path: str, shot: Shot, target_w: int, target_h: int, fps: int, grade: str
+    video_path: str,
+    shot: Shot,
+    target_w: int,
+    target_h: int,
+    fps: int,
+    grade: str,
+    random_start: bool = False,
 ) -> VideoClip:
     """Build a shot clip from a downloaded stock video file.
+
+    `random_start`, when True, picks a uniformly random start point within
+    the source instead of the fixed "centered" start below. This is used
+    specifically for a user's own supplied video(s) (see `user_media.py` /
+    `pipeline._make_user_media_resolver`): since a song typically has many
+    more shots than a user is likely to supply distinct video files for,
+    the *same* file gets reused across many shots (via round-robin
+    cycling in the resolver) -- with the default fixed-centered start,
+    every one of those reuses would show the exact same few seconds of
+    footage over and over, which looks obviously repetitive over a
+    multi-minute video. A random start each time gives real variety (a
+    different 3-5-second-ish excerpt of the same clip) across repeated
+    uses. Left False (the previous, already-verified behavior) for
+    Wikimedia/Pexels/Pixabay videos, where each shot already gets a
+    genuinely different downloaded file most of the time (see
+    `_make_shot_media_resolver`'s per-query candidate cycling), so a
+    random start there would mostly just add noise without a real
+    benefit, and changing it would mean re-verifying an already-tested
+    code path for no gain.
 
     IMPORTANT resource-management note: `VideoFileClip` opens an FFmpeg
     subprocess (a real OS process + pipe) for the lifetime of the object,
@@ -386,9 +446,17 @@ def build_video_shot_clip(
     source = _correct_non_square_pixels(raw, video_path)
 
     if source.duration >= needed:
-        # centered subclip so we don't always start at frame 0 of stock footage
         max_start = max(0.0, source.duration - needed)
-        start = min(max_start, max_start / 2)
+        if random_start:
+            # A fresh Random() per call (not seeded) is deliberate here --
+            # the whole point is that repeated calls for the *same* source
+            # file (across many shots reusing a small set of user-supplied
+            # videos) land on different excerpts each time, which a fixed
+            # seed would defeat.
+            start = random.uniform(0.0, max_start)
+        else:
+            # centered subclip so we don't always start at frame 0 of stock footage
+            start = min(max_start, max_start / 2)
         clip = source.subclip(start, start + needed)
     else:
         # loop short stock clips to cover the shot duration. Each repeated
@@ -466,14 +534,29 @@ def build_shot_clip(
 ) -> VideoClip:
     """Dispatch to the right clip builder based on resolved media `kind`.
 
-    `kind` is one of 'image', 'video', or 'procedural' (also used whenever
-    `local_path` is falsy/missing, so a bad download never breaks the shot).
+    `kind` is one of 'image', 'video', 'user_image', 'user_video', or
+    'procedural' (also used whenever `local_path` is falsy/missing, so a
+    bad download never breaks the shot). The 'user_*' kinds (see
+    `user_media.py` / `pipeline._make_user_media_resolver`) get the same
+    underlying builder as their plain counterparts, plus the extra
+    treatment meant specifically for the user's own supplied media: a
+    glow/sparkle VFX overlay for stills, and a randomized (not fixed)
+    start point for video excerpts -- see `build_image_shot_clip`'s
+    `add_vfx_overlay` and `build_video_shot_clip`'s `random_start` params.
     """
     try:
         if kind == "image" and local_path:
             return build_image_shot_clip(local_path, shot, target_w, target_h, fps, mood.color_grade)
+        if kind == "user_image" and local_path:
+            return build_image_shot_clip(
+                local_path, shot, target_w, target_h, fps, mood.color_grade, add_vfx_overlay=True
+            )
         if kind == "video" and local_path:
             return build_video_shot_clip(local_path, shot, target_w, target_h, fps, mood.color_grade)
+        if kind == "user_video" and local_path:
+            return build_video_shot_clip(
+                local_path, shot, target_w, target_h, fps, mood.color_grade, random_start=True
+            )
     except Exception as exc:
         # If building the video clip failed partway through (e.g. "failed
         # to read the first frame", a corrupted/truncated download), any

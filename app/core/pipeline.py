@@ -31,6 +31,7 @@ from .media_fetcher import download_asset, search_media
 from .mood import MoodProfile, classify_mood
 from .shot_planner import Shot, plan_shots
 from .transcribe import TranscriptResult, transcribe_audio
+from .user_media import scan_user_media
 from .video_builder import assemble_video
 from .wikimedia_fetcher import WikimediaAsset
 from .wikimedia_fetcher import download_asset as download_wikimedia_asset
@@ -51,6 +52,12 @@ class PipelineResult:
     render_seconds: float
     used_stock_media_count: int = 0
     used_procedural_count: int = 0
+    # Shots that used a file the user placed in their own
+    # USER_MEDIA_DIR/<deity>/ folder (see user_media.py) -- these take
+    # priority over Wikimedia/Pexels/Pixabay for every shot in a song
+    # once any such file is found, so this is typically either 0 (no
+    # user media supplied / no deity detected) or equal to the shot count.
+    used_user_media_count: int = 0
     # Wikimedia Commons assets actually used in the render, if any --
     # these carry a CC-BY-SA-style attribution requirement that
     # Pexels/Pixabay assets don't, so they're tracked separately for
@@ -71,6 +78,46 @@ def _default_output_path(audio_path: str) -> str:
     stem = Path(audio_path).stem
     ts = time.strftime("%Y%m%d_%H%M%S")
     return str(OUTPUT_DIR / f"{stem}_{ts}.mp4")
+
+
+def _make_user_media_resolver(assets: list):
+    """Build a `resolve(query, prefer_video) -> (local_path, kind)` closure
+    that ignores `query` entirely and just round-robins through `assets`
+    (the caller's own supplied photos/videos for the song's detected
+    deity -- see `user_media.scan_user_media`).
+
+    Ignoring `query` is deliberate: once a user has supplied their own
+    footage of the actual subject, every shot in the song should use it,
+    not just the shots whose keyword happens to match a deity term (see
+    this module's docstring / the PR description for why the old
+    deity-keyword-only routing still left several shots looking
+    unrelated). `prefer_video` is honored as a soft preference (video
+    assets are tried first if the caller prefers video) but a user who
+    only supplied images still gets images, and vice versa.
+
+    Returned `kind` is `"user_image"` / `"user_video"` (not the plain
+    `"image"` / `"video"` used for Wikimedia/Pexels/Pixabay) so
+    `video_builder.build_shot_clip` can apply the extra treatment meant
+    specifically for user-supplied media: a subtle animated VFX overlay
+    on stills, and randomized (not fixed-centered) start points on video
+    excerpts so a small set of clips still looks varied across many
+    shots. See video_builder.py's `build_shot_clip` docstring.
+    """
+    images = [a for a in assets if a.kind == "image"]
+    videos = [a for a in assets if a.kind == "video"]
+    index = {"image": 0, "video": 0}
+
+    def resolve(query: str, prefer_video: bool) -> tuple[str | None, str]:
+        order = [("video", videos), ("image", images)] if prefer_video else [("image", images), ("video", videos)]
+        for kind, pool in order:
+            if not pool:
+                continue
+            i = index[kind] % len(pool)
+            index[kind] += 1
+            return pool[i].local_path, f"user_{kind}"
+        return None, "procedural"
+
+    return resolve
 
 
 def _make_shot_media_resolver(settings: Settings, deity_queries: frozenset[str] = frozenset()):
@@ -243,14 +290,33 @@ def run_pipeline(
             f"Devotional/spiritual theme detected ({', '.join(content_hints.matched_terms[:3])}) "
             "— using matching visuals.",
         )
-    if content_hints.deity:
+    # If the user has placed their own photos/videos of this deity under
+    # USER_MEDIA_DIR (see user_media.py), those take absolute priority --
+    # every shot in the song uses them, bypassing Wikimedia/Pexels/
+    # Pixabay/procedural entirely, since the user has explicitly supplied
+    # footage of the actual subject. Checked before deciding whether to
+    # even mention Wikimedia in the progress log, so the messaging is
+    # accurate about which source is actually being used.
+    user_media_assets = scan_user_media(content_hints.deity) if content_hints.deity else []
+
+    if user_media_assets:
+        kinds_summary = f"{sum(1 for a in user_media_assets if a.kind == 'video')} video(s), {sum(1 for a in user_media_assets if a.kind == 'image')} photo(s)"
+        report(
+            0.335,
+            f"Using your own {content_hints.deity} media ({kinds_summary}) for every shot.",
+        )
+    elif content_hints.deity:
         report(0.335, f"Specific deity detected: {content_hints.deity} — checking Wikimedia Commons for real footage.")
 
     # When a specific deity was identified, put its Wikimedia-tuned search
     # terms *ahead of* the generic devotional keywords in the cycle shots
     # draw from -- this biases most shots toward the actual named subject
     # (e.g. "Khatu Shyam") while still mixing in generic devotional
-    # visuals (temple/diya/prayer) for variety across a long track.
+    # visuals (temple/diya/prayer) for variety across a long track. This
+    # keyword list is still passed to plan_shots() even when user_media_assets
+    # is non-empty (it drives the progress-log "fetching visuals for X"
+    # message and stays available if the user later empties the folder),
+    # but the resolver built below ignores it entirely in that case.
     combined_keywords = (content_hints.deity_search_terms + content_hints.keywords) or None
 
     report(0.34, "Planning beat-synced shots...")
@@ -275,10 +341,14 @@ def run_pipeline(
     resolved_media: dict[int, tuple[str | None, str]] = {}
     stock_count = 0
     procedural_count = 0
+    user_media_count = 0
     fetch_span = 0.32  # 38% -> 70%
-    resolve_media_for_shot = _make_shot_media_resolver(
-        settings, deity_queries=frozenset(content_hints.deity_search_terms)
-    )
+    if user_media_assets:
+        resolve_media_for_shot = _make_user_media_resolver(user_media_assets)
+    else:
+        resolve_media_for_shot = _make_shot_media_resolver(
+            settings, deity_queries=frozenset(content_hints.deity_search_terms)
+        )
     for i, shot in enumerate(shots):
         check_cancel()
         query = shot.keywords[0] if shot.keywords else mood.keywords[0]
@@ -287,14 +357,20 @@ def run_pipeline(
             f"Fetching visuals for shot {i + 1}/{len(shots)} ({query})...",
         )
         local_path, kind = resolve_media_for_shot(query, shot.prefer_video)
-        if local_path:
+        if local_path and kind in ("user_image", "user_video"):
+            resolved_media[shot.index] = (local_path, kind)
+            user_media_count += 1
+        elif local_path:
             resolved_media[shot.index] = (local_path, kind)
             stock_count += 1
         else:
             resolved_media[shot.index] = (None, "procedural")
             procedural_count += 1
 
-    report(0.70, f"Visuals resolved: {stock_count} from stock, {procedural_count} generated.")
+    if user_media_count:
+        report(0.70, f"Visuals resolved: {user_media_count} from your own media.")
+    else:
+        report(0.70, f"Visuals resolved: {stock_count} from stock, {procedural_count} generated.")
     check_cancel()
 
     # --- Stage 6: render final video (70% - 100%) ---------------------------
@@ -324,7 +400,11 @@ def run_pipeline(
     # Pexels/Pixabay, is almost always attribution-licensed). A no-op
     # (returns None, writes nothing) when the list is empty, which is the
     # common case for renders that never matched a specific named deity.
-    wikimedia_assets_used = resolve_media_for_shot.wikimedia_assets_used
+    # The user-media resolver (used when the user supplied their own
+    # files) has no such attribute at all -- the user's own media needs
+    # no Wikimedia-style attribution tracking, so this is simply skipped
+    # in that case.
+    wikimedia_assets_used = getattr(resolve_media_for_shot, "wikimedia_assets_used", [])
     credits_file_path = write_credits_file(wikimedia_assets_used, final_path)
     if credits_file_path:
         report(1.0, f"Done! Saved to {final_path} (see {Path(credits_file_path).name} for media credits)")
@@ -340,6 +420,7 @@ def run_pipeline(
         render_seconds=render_seconds,
         used_stock_media_count=stock_count,
         used_procedural_count=procedural_count,
+        used_user_media_count=user_media_count,
         wikimedia_assets_used=wikimedia_assets_used,
         credits_file_path=credits_file_path,
     )

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import RESOLUTION_CHOICES, WHISPER_MODEL_CHOICES, Settings
+from ..core.user_media import ensure_user_media_dirs
 from .worker import PipelineWorker
 
 AUDIO_FILE_FILTER = "Audio files (*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.wma);;All files (*.*)"
@@ -162,9 +163,15 @@ class CreateVideoTab(QWidget):
         self.status_label.setText(f"Done! Mood: {result.mood.label} — saved to {result.output_path}")
         self.log_view.appendPlainText(
             f"\nFinished. Mood='{result.mood.label}', shots={len(result.shots)}, "
-            f"stock_media={result.used_stock_media_count}, procedural={result.used_procedural_count}, "
+            f"stock_media={result.used_stock_media_count}, "
+            f"your_own_media={result.used_user_media_count}, procedural={result.used_procedural_count}, "
             f"render_time={result.render_seconds:.1f}s"
         )
+        if result.used_user_media_count:
+            self.log_view.appendPlainText(
+                f"\nUsed your own supplied photos/videos for all {result.used_user_media_count} shot(s) "
+                "in this video (see Settings tab for the folder)."
+            )
         # Wikimedia Commons media (unlike Pexels/Pixabay) generally requires
         # crediting the original author under its CC license -- surface that
         # clearly rather than leaving it buried only in the credits .txt file
@@ -273,6 +280,37 @@ class SettingsTab(QWidget):
         wikimedia_group.setLayout(wform)
         layout.addWidget(wikimedia_group)
 
+        user_media_group = QGroupBox("Your Own Deity Photos/Videos (highest priority — no sign-up needed)")
+        umform = QFormLayout()
+        # ensure_user_media_dirs() also creates the per-deity subfolders
+        # (with an explanatory README.txt in each) the first time the
+        # Settings tab is built, so a folder is always ready to browse to
+        # here even if the user has never processed a matching song yet.
+        self._user_media_dir = ensure_user_media_dirs()
+        self.user_media_path_edit = QLineEdit(str(self._user_media_dir))
+        self.user_media_path_edit.setReadOnly(True)
+        open_user_media_btn = QPushButton("Open Folder")
+        open_user_media_btn.clicked.connect(self._open_user_media_folder)
+        path_row = QHBoxLayout()
+        path_row.addWidget(self.user_media_path_edit, stretch=1)
+        path_row.addWidget(open_user_media_btn)
+        umform.addRow("Folder:", path_row)
+        user_media_note = QLabel(
+            "If a song is about a specific deity Audio2Video recognizes (see the folder\n"
+            "names inside — Khatu Shyam, Krishna, Hanuman, etc.), drop your own\n"
+            "royalty-free photos/videos of that deity into the matching subfolder.\n"
+            "When you do, Audio2Video uses ONLY your own files for every shot in that\n"
+            "song — it skips Wikimedia Commons, Pexels and Pixabay entirely for it, so\n"
+            "the whole video matches your own footage instead of generic visuals.\n"
+            "Videos are used in randomly-varied few-second excerpts across shots, and\n"
+            "photos automatically get a subtle animated glow/sparkle effect added.\n"
+            "Leave the folder empty to keep using Wikimedia/Pexels/Pixabay as before."
+        )
+        user_media_note.setWordWrap(True)
+        umform.addRow(user_media_note)
+        user_media_group.setLayout(umform)
+        layout.addWidget(user_media_group)
+
         save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self._save)
         layout.addWidget(save_btn)
@@ -289,6 +327,21 @@ class SettingsTab(QWidget):
         self.use_stt_check.setChecked(s.use_speech_to_text)
         self.whisper_combo.setCurrentText(s.whisper_model_size)
         self.use_wikimedia_check.setChecked(s.use_wikimedia)
+
+    def _open_user_media_folder(self) -> None:
+        # Mirrors CreateVideoTab._open_output_folder's platform-specific
+        # "reveal in file manager" logic (same fallback-to-message-box
+        # pattern if the platform-specific opener call itself fails).
+        folder = str(self._user_media_dir)
+        try:
+            if sys.platform.startswith("linux"):
+                subprocess.Popen(["xdg-open", folder])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            elif sys.platform.startswith("win"):
+                os.startfile(folder)  # type: ignore[attr-defined]
+        except Exception:
+            QMessageBox.information(self, "Folder location", f"Your media folder is at:\n{folder}")
 
     def _save(self) -> None:
         s = self.settings
@@ -315,10 +368,15 @@ ABOUT_HTML = """
   <li><b>Lyrics/speech detection</b> — faster-whisper, runs fully offline</li>
   <li><b>Stock visuals</b> — <a href="https://www.pexels.com/api/">Pexels</a> and
       <a href="https://pixabay.com/api/docs/">Pixabay</a> free APIs (free sign-up, no credit card)</li>
+  <li><b>Your own photos/videos</b> — the highest-priority source of all. Drop your own
+      royalty-free deity photos/videos into the per-deity folder shown in the
+      <b>Settings</b> tab, and Audio2Video uses ONLY those for every shot in a matching
+      song, skipping Wikimedia/Pexels/Pixabay entirely for it</li>
   <li><b>Deity-specific visuals</b> — <a href="https://commons.wikimedia.org/">Wikimedia Commons</a>
       (no sign-up/API key needed at all). Used automatically when a devotional song's filename
-      or lyrics name a specific deity or temple (e.g. Khatu Shyam, Hanuman) — Pexels/Pixabay have
-      no coverage of these, but Wikimedia has real devotee-submitted photos and video</li>
+      or lyrics name a specific deity or temple (e.g. Khatu Shyam, Hanuman) and you haven't
+      supplied your own media for it — Pexels/Pixabay have no coverage of these, but Wikimedia
+      has real devotee-submitted photos and video</li>
   <li><b>Procedural fallback visuals</b> — generated locally, used automatically whenever
       no API key is configured or no stock result matches</li>
   <li><b>Sound effects</b> — synthetic (numpy-generated) by default, optionally

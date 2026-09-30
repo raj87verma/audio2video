@@ -42,9 +42,10 @@ resources**. No paid APIs, no subscriptions required.
 4. Shot planning                          → beat-aligned list of shots
        │
        ▼
-5. Stock media fetch      (Wikimedia Commons for named deities, then
-       │                   Pexels / Pixabay, optional)  → photo/video per shot
-       │                  ↳ falls back to generated visuals if no key / no match
+5. Media fetch  (your own supplied photos/videos, if any, for every shot;
+       │         else Wikimedia Commons for named deities; else
+       │         Pexels / Pixabay, optional)  → photo/video per shot
+       │        ↳ falls back to generated visuals if none of the above match
        ▼
 6. Video assembly         (MoviePy / FFmpeg)
        ↳ Ken Burns zoom/pan on stills, crossfades, mood color grading
@@ -52,6 +53,52 @@ resources**. No paid APIs, no subscriptions required.
        ▼
    finished .mp4 (+ a credits.txt if Wikimedia media was used)
 ```
+
+### Use your own photos/videos (highest priority)
+
+Even with deity-specific Wikimedia footage (below), a song's shots still
+cycle through a *mix* of the deity's own visuals and generic devotional
+terms ("hindu temple", "diya lamp", ...) for variety — so a few shots out
+of a longer video can still end up looking generic rather than specific to
+your song's subject. If you have your own royalty-free photos/videos —
+of Khatu Shyam, or any other deity in the recognized list — you can supply
+them directly, and Audio2Video will use **only your own files, for every
+single shot**, skipping Wikimedia/Pexels/Pixabay entirely for that song.
+
+**Where to put them:** open the app's **Settings** tab → find "Your Own
+Deity Photos/Videos" → the folder path is shown there (click **Open
+Folder** to jump straight to it in your file manager). By default this is:
+
+- Windows: `%USERPROFILE%\.audio2video\user_media\<deity>\`
+- macOS/Linux: `~/.audio2video/user_media/<deity>/`
+
+Inside `user_media/` there's already one ready-made subfolder per
+recognized deity (`khatu_shyam/`, `krishna/`, `hanuman/`, `shiva/`, ...,
+matching the same list in "Deity-specific footage" below), each containing
+a short `README.txt`. Just drop your files into the matching subfolder —
+e.g. for Khatu Shyam, into `user_media/khatu_shyam/`. Supported formats:
+images (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`) and videos (`.mp4`,
+`.mov`, `.webm`, `.mkv`, `.avi`, `.m4v`).
+
+What happens with your files:
+- **Videos** are used in short excerpts (matching each shot's length, a
+  few seconds at a time). Since a song usually has many more shots than
+  you're likely to supply distinct video files for, the *same* video gets
+  reused across multiple shots — each reuse picks a different, randomly
+  chosen part of the clip, so a single video still gives visual variety
+  across a whole song instead of looping the same few seconds every time.
+- **Photos** get the same Ken Burns pan/zoom and color grading as any
+  other still image, plus a subtle animated glow + twinkling sparkle
+  effect layered on top, so a static personal photo doesn't look
+  completely motionless next to the rest of the video.
+- If the matching folder is empty, nothing changes — the song falls back
+  to Wikimedia Commons / Pexels / Pixabay / generated visuals exactly as
+  described below, with no extra configuration needed.
+
+Only use media you actually have the rights to use for this (your own
+photos/videos, or ones whose license explicitly permits it) — this
+feature doesn't check licensing for you, since it's your own supplied
+files.
 
 ### Content-aware visuals
 
@@ -244,6 +291,10 @@ checkpoint (in-progress downloads/renders are not partially corrupted).
   requires no key/sign-up. Turn off if you'd rather every shot come only
   from Pexels/Pixabay/generated visuals, or to avoid the attribution
   requirement described in the licensing section below.
+- **Your Own Deity Photos/Videos folder** — a read-only path display plus
+  an **Open Folder** button; see "Use your own photos/videos" above.
+  There's no on/off toggle for this one — it's simply used whenever the
+  matching deity subfolder has at least one supported file in it.
 
 ---
 
@@ -254,7 +305,9 @@ checkpoint (in-progress downloads/renders are not partially corrupted).
   soft pastel, neutral cinematic), crossfade transitions between shots, and
   — whenever no stock footage matches — a fully generated animated
   background (gradient + drifting particles + a live waveform visualizer
-  reacting to your track's actual loudness).
+  reacting to your track's actual loudness). Your own supplied deity
+  photos additionally get a subtle animated glow + twinkling sparkle
+  overlay (see "Use your own photos/videos" above).
 - **SFX**: a layer of procedurally synthesized whooshes, impacts, risers
   and sparkles, automatically placed at shot transitions and at strong
   musical accents (onsets) in high-energy sections — mixed underneath your
@@ -312,6 +365,7 @@ audio2video/
 │   │   ├── shot_planner.py      beat-aligned shot list
 │   │   ├── media_fetcher.py     Pexels/Pixabay free stock media client
 │   │   ├── wikimedia_fetcher.py Wikimedia Commons client (named-deity footage)
+│   │   ├── user_media.py        scans the user's own supplied deity photos/videos
 │   │   ├── credits.py           builds the Wikimedia attribution credits file
 │   │   ├── procedural_visuals.py fallback animated visuals (PIL/numpy)
 │   │   ├── sfx.py               synthetic SFX + optional Freesound client
@@ -372,3 +426,9 @@ print(result.output_path, result.mood.label)
   deities (Krishna, Hanuman, Shiva, ...) tend to have far more real photos
   and video than more regional/local ones, so visual variety per deity is
   not guaranteed to be equally rich across the list.
+- Your own supplied media (see "Use your own photos/videos" above) is an
+  all-or-nothing switch per song: as soon as the matching deity folder has
+  at least one supported file, *every* shot in that song uses your own
+  media, with no way to mix in Wikimedia/Pexels/Pixabay visuals alongside
+  it for extra variety. If you want a mix, that currently means manually
+  supplying enough of your own variety to cover the whole song.
