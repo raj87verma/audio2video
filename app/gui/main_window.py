@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import RESOLUTION_CHOICES, WHISPER_MODEL_CHOICES, Settings
+from ..core.local_media import ensure_local_media_subdirs, scan_local_media_dir
 from ..core.user_media import ensure_user_media_dirs
 from .worker import PipelineWorker
 
@@ -164,10 +166,16 @@ class CreateVideoTab(QWidget):
         self.log_view.appendPlainText(
             f"\nFinished. Mood='{result.mood.label}', shots={len(result.shots)}, "
             f"stock_media={result.used_stock_media_count}, "
+            f"local_media={result.used_local_media_count}, "
             f"your_own_media={result.used_user_media_count}, procedural={result.used_procedural_count}, "
             f"render_time={result.render_seconds:.1f}s"
         )
-        if result.used_user_media_count:
+        if result.used_local_media_count:
+            self.log_view.appendPlainText(
+                f"\nUsed your local-only media folder for all {result.used_local_media_count} shot(s) "
+                "in this video (online sources were not used at all)."
+            )
+        elif result.used_user_media_count:
             self.log_view.appendPlainText(
                 f"\nUsed your own supplied photos/videos for all {result.used_user_media_count} shot(s) "
                 "in this video (see Settings tab for the folder)."
@@ -311,6 +319,48 @@ class SettingsTab(QWidget):
         user_media_group.setLayout(umform)
         layout.addWidget(user_media_group)
 
+        local_media_group = QGroupBox(
+            "Local-Only Media Folder (PERMANENT — completely disables all online sources)"
+        )
+        lmform = QFormLayout()
+        self.local_media_path_edit = QLineEdit()
+        self.local_media_path_edit.setPlaceholderText("No folder selected — online sources are used as usual")
+        local_browse_btn = QPushButton("Browse...")
+        local_browse_btn.clicked.connect(self._browse_local_media_folder)
+        local_clear_btn = QPushButton("Clear")
+        local_clear_btn.clicked.connect(self._clear_local_media_folder)
+        local_open_btn = QPushButton("Open Folder")
+        local_open_btn.clicked.connect(self._open_local_media_folder)
+        local_path_row = QHBoxLayout()
+        local_path_row.addWidget(self.local_media_path_edit, stretch=1)
+        local_path_row.addWidget(local_browse_btn)
+        local_path_row.addWidget(local_clear_btn)
+        local_path_row.addWidget(local_open_btn)
+        lmform.addRow("Folder:", local_path_row)
+        self.local_media_count_label = QLabel("")
+        self.local_media_count_label.setWordWrap(True)
+        lmform.addRow(self.local_media_count_label)
+        local_media_note = QLabel(
+            "Point this at any folder of your own royalty-free photos/videos, organized\n"
+            "into two subfolders — \"images\" and \"videos\" — inside it (created\n"
+            "automatically the first time you pick a folder here). Once a folder is set,\n"
+            "Audio2Video uses ONLY the files in it for EVERY song you process, for EVERY\n"
+            "shot — it never calls Wikimedia Commons, Pexels, or Pixabay again, for any\n"
+            "song, until you clear this field. This is different from \"Your Own Deity\n"
+            "Photos/Videos\" above, which only activates for songs about a specific\n"
+            "recognized deity and still falls back online if that folder is empty — this\n"
+            "one is a single global switch that applies to everything, with no online\n"
+            "fallback at all (an empty folder just means generated visuals are used\n"
+            "instead). If both are set, this folder takes priority over everything else.\n"
+            "Videos are used in short, randomly varied 2-4 second excerpts per shot;\n"
+            "photos automatically get a subtle animated glow/sparkle effect added.\n"
+            "Click \"Clear\" to turn this off and go back to the normal online sources."
+        )
+        local_media_note.setWordWrap(True)
+        lmform.addRow(local_media_note)
+        local_media_group.setLayout(lmform)
+        layout.addWidget(local_media_group)
+
         save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self._save)
         layout.addWidget(save_btn)
@@ -327,6 +377,67 @@ class SettingsTab(QWidget):
         self.use_stt_check.setChecked(s.use_speech_to_text)
         self.whisper_combo.setCurrentText(s.whisper_model_size)
         self.use_wikimedia_check.setChecked(s.use_wikimedia)
+        self.local_media_path_edit.setText(s.local_media_dir)
+        self._refresh_local_media_count()
+
+    def _refresh_local_media_count(self) -> None:
+        """Re-scan the currently-entered local-media path and update the
+        count label. Called after loading settings, after Browse/Clear,
+        and after Save, so the counts shown are never stale relative to
+        whatever's actually on disk or in the text field.
+        """
+        path = self.local_media_path_edit.text().strip()
+        if not path:
+            self.local_media_count_label.setText("")
+            return
+        assets = scan_local_media_dir(path)
+        images = sum(1 for a in assets if a.kind == "image")
+        videos = sum(1 for a in assets if a.kind == "video")
+        if assets:
+            self.local_media_count_label.setText(
+                f"Found {images} image(s) and {videos} video(s) in this folder."
+            )
+        else:
+            self.local_media_count_label.setText(
+                "This folder currently has no usable images/videos in it — "
+                "shots will use generated visuals until you add some (online "
+                "sources will still stay disabled)."
+            )
+
+    def _browse_local_media_folder(self) -> None:
+        start_dir = self.local_media_path_edit.text().strip() or str(Path.home())
+        path = QFileDialog.getExistingDirectory(self, "Choose your local media folder", start_dir)
+        if not path:
+            return
+        try:
+            ensure_local_media_subdirs(path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Could not use this folder",
+                f"Couldn't create 'images'/'videos' subfolders in:\n{path}\n\n{exc}",
+            )
+            return
+        self.local_media_path_edit.setText(path)
+        self._refresh_local_media_count()
+
+    def _clear_local_media_folder(self) -> None:
+        self.local_media_path_edit.clear()
+        self._refresh_local_media_count()
+
+    def _open_local_media_folder(self) -> None:
+        folder = self.local_media_path_edit.text().strip()
+        if not folder:
+            QMessageBox.information(self, "No folder set", "Choose a folder with Browse... first.")
+            return
+        try:
+            if sys.platform.startswith("linux"):
+                subprocess.Popen(["xdg-open", folder])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            elif sys.platform.startswith("win"):
+                os.startfile(folder)  # type: ignore[attr-defined]
+        except Exception:
+            QMessageBox.information(self, "Folder location", f"Your local media folder is at:\n{folder}")
 
     def _open_user_media_folder(self) -> None:
         # Mirrors CreateVideoTab._open_output_folder's platform-specific
@@ -354,7 +465,9 @@ class SettingsTab(QWidget):
         s.use_speech_to_text = self.use_stt_check.isChecked()
         s.whisper_model_size = self.whisper_combo.currentText()
         s.use_wikimedia = self.use_wikimedia_check.isChecked()
+        s.local_media_dir = self.local_media_path_edit.text().strip()
         s.save()
+        self._refresh_local_media_count()
         self._on_save(s)
         QMessageBox.information(self, "Settings saved", "Your settings have been saved.")
 
@@ -368,10 +481,15 @@ ABOUT_HTML = """
   <li><b>Lyrics/speech detection</b> — faster-whisper, runs fully offline</li>
   <li><b>Stock visuals</b> — <a href="https://www.pexels.com/api/">Pexels</a> and
       <a href="https://pixabay.com/api/docs/">Pixabay</a> free APIs (free sign-up, no credit card)</li>
-  <li><b>Your own photos/videos</b> — the highest-priority source of all. Drop your own
-      royalty-free deity photos/videos into the per-deity folder shown in the
-      <b>Settings</b> tab, and Audio2Video uses ONLY those for every shot in a matching
-      song, skipping Wikimedia/Pexels/Pixabay entirely for it</li>
+  <li><b>Local-only media folder</b> — the absolute highest priority. Point the
+      <b>Settings</b> tab at any folder of your own royalty-free photos/videos and
+      Audio2Video will use ONLY that folder, for every song, for every shot — it
+      permanently stops calling Wikimedia/Pexels/Pixabay entirely until you clear it</li>
+  <li><b>Your own deity photos/videos</b> — a lighter-weight alternative to the above.
+      Drop your own royalty-free deity photos/videos into the per-deity folder shown in
+      the <b>Settings</b> tab, and Audio2Video uses ONLY those for every shot in a matching
+      song, skipping Wikimedia/Pexels/Pixabay entirely for it (still falls back online for
+      other songs, unlike the local-only folder above)</li>
   <li><b>Deity-specific visuals</b> — <a href="https://commons.wikimedia.org/">Wikimedia Commons</a>
       (no sign-up/API key needed at all). Used automatically when a devotional song's filename
       or lyrics name a specific deity or temple (e.g. Khatu Shyam, Hanuman) and you haven't
