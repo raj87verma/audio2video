@@ -75,6 +75,13 @@ Drop any number of files into `images/` and `videos/` (supported formats:
 `.mkv`/`.avi`/`.m4v` for videos). The Settings tab shows a live count of
 how many of each it finds.
 
+You don't have to use the subfolders at all — any supported image/video
+file placed **directly inside the folder you picked** (not in any further
+subfolder) is also detected automatically, classified by its own file
+extension. This is useful if you already have a folder of photos/videos
+and would rather just point Audio2Video at it than reorganize everything
+into `images/`/`videos/` first.
+
 What happens with your files:
 - Every shot in every video you create cycles through the files in this
   folder — images and videos mixed together, not "all video first, then

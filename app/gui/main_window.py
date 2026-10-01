@@ -225,9 +225,10 @@ class SettingsTab(QWidget):
         local_media_note = QLabel(
             "Audio2Video does not use Pexels, Pixabay, Wikimedia Commons, or any other\n"
             "online resource for visuals — it never has an option to. The only source\n"
-            "of real photos/videos is a folder you choose here, organized into two\n"
-            "subfolders — \"images\" and \"videos\" — created automatically the first\n"
-            "time you pick a folder below.\n\n"
+            "of real photos/videos is a folder you choose here. Two subfolders —\n"
+            "\"images\" and \"videos\" — are created automatically the first time you\n"
+            "pick a folder below; you can put files in those, or just drop them\n"
+            "directly in the main folder itself — both are scanned.\n\n"
             "Every shot in every video you create cycles through the files in this\n"
             "folder (images and videos mixed together). If the folder is empty or no\n"
             "folder is set, shots use an animated generated background instead — this\n"
