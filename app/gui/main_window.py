@@ -207,6 +207,7 @@ class SettingsTab(QWidget):
         lmform = QFormLayout()
         self.local_media_path_edit = QLineEdit()
         self.local_media_path_edit.setPlaceholderText("No folder selected — videos will use generated visuals")
+        self.local_media_path_edit.editingFinished.connect(self._on_local_media_path_edited)
         local_browse_btn = QPushButton("Browse...")
         local_browse_btn.clicked.connect(self._browse_local_media_folder)
         local_clear_btn = QPushButton("Clear")
@@ -280,6 +281,29 @@ class SettingsTab(QWidget):
         self.local_media_path_edit.setText(s.local_media_dir)
         self._refresh_local_media_count()
 
+    def _persist_local_media_dir(self) -> None:
+        """Write the folder currently shown in the text field straight into
+        the shared Settings object (and disk) immediately.
+
+        This used to happen ONLY inside `_save()`, triggered exclusively by
+        the "Save Settings" button. That meant Browse-ing to a folder (and
+        seeing "Found N video(s)") did NOT actually make that folder usable
+        by "Create Video" unless the user remembered to also click "Save
+        Settings" first. Clicking Create Video in between left the pipeline
+        running against the old/empty `local_media_dir`, silently falling
+        back to generated visuals. Persisting on every change (Browse,
+        Clear, and manual edits) removes that trap entirely.
+        """
+        path = self.local_media_path_edit.text().strip()
+        if self.settings.local_media_dir == path:
+            return
+        self.settings.local_media_dir = path
+        self.settings.save()
+
+    def _on_local_media_path_edited(self) -> None:
+        self._persist_local_media_dir()
+        self._refresh_local_media_count()
+
     def _refresh_local_media_count(self) -> None:
         """Re-scan the currently-entered local-media path and update the
         count label. Called after loading settings, after Browse/Clear,
@@ -317,10 +341,12 @@ class SettingsTab(QWidget):
             )
             return
         self.local_media_path_edit.setText(path)
+        self._persist_local_media_dir()
         self._refresh_local_media_count()
 
     def _clear_local_media_folder(self) -> None:
         self.local_media_path_edit.clear()
+        self._persist_local_media_dir()
         self._refresh_local_media_count()
 
     def _open_local_media_folder(self) -> None:
