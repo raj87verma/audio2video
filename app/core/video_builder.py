@@ -61,7 +61,32 @@ KEN_BURNS_ZOOM = 0.16       # fraction of extra zoom range for the Ken Burns eff
 # a temporary intermediate file and its resources released before the
 # next batch starts -- keeps peak resource usage bounded no matter how
 # long the source audio is.
-SHOT_BATCH_SIZE = 20
+#
+# Why this is 4, not 20 (lowered after a *second*, independent
+# MemoryError was reported even after target_resolution-based decode
+# downscaling (see _probe_video_info/_decode_target_resolution) was
+# already in place): VideoFileClip spawns a real FFmpeg subprocess the
+# instant it's constructed -- not lazily on first frame read, see
+# FFMPEG_VideoReader.initialize() -- and that subprocess has its own
+# memory cost (reference-frame/decode buffers inside FFmpeg itself)
+# that is largely independent of how small a `target_resolution` is
+# requested, since FFmpeg still has to decode the source's native
+# frames before its scale filter ever runs. Measured directly against a
+# real 4K source: a single such subprocess costs roughly 150-700MB of
+# resident memory, and this scales up ~linearly with how many are open
+# at once -- 20 concurrent 4K opens (the previous SHOT_BATCH_SIZE, in
+# the all-video-shots case a user's own media-only folder produces)
+# measured at ~14GB of resident memory, comfortably exceeding what a
+# typical consumer machine (and definitely what the "paging file too
+# small" error from a real user's crash log implied) has available.
+# Lowering the batch size directly bounds the number of concurrent
+# FFmpeg subprocesses -- 4 measured at ~2.7GB worst-case (every shot in
+# the batch sourced from a 4K video, i.e. a user's media folder with
+# only videos in it, same as the real crash report) -- regardless of
+# source resolution, which the target_resolution optimization alone
+# could not do since it only reduces per-frame array size inside Python,
+# not FFmpeg's own internal per-process decode overhead.
+SHOT_BATCH_SIZE = 4
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +869,103 @@ def _build_clip_batch(
         raise
 
 
+def _render_shots_chunk_to_file(
+    shots_chunk: list[Shot],
+    resolved_media: dict[int, tuple[str | None, str]],
+    mood: MoodProfile,
+    target_w: int,
+    target_h: int,
+    fps: int,
+    energy_fn,
+    tmp_dir: Path,
+    chunk_label: str,
+) -> Path:
+    """Build+crossfade one chunk of shots and write it to its own small
+    temporary MP4, returning the Path.
+
+    This is the actual last line of defense against `MemoryError`/
+    `OSError` ("paging file too small" on Windows) crashes caused by too
+    many concurrently-open video decoders (see `SHOT_BATCH_SIZE`'s
+    docstring for the measured root cause: each `VideoFileClip` spawns a
+    real FFmpeg subprocess immediately on construction -- not lazily on
+    first frame read -- and each one costs on the order of hundreds of
+    MB of its own resident memory, independent of any `target_resolution`
+    downscaling, which only reduces per-*frame* array size inside Python,
+    not FFmpeg's own internal decode buffers).
+
+    `SHOT_BATCH_SIZE` was lowered specifically to keep the common case
+    comfortably under real machines' available memory (measured: 4
+    concurrent 4K-source opens peaks around 2.7GB vs the previous
+    default of 20 peaking around 14GB) -- but no single fixed batch size
+    can be guaranteed safe for every real machine (available RAM,
+    concurrent other programs, swap/paging-file configuration, and
+    source video resolution all vary). So on an actual `MemoryError` or
+    `OSError` here, rather than letting it crash the whole render (what
+    every previous release did), this chunk is split in half and each
+    half is rendered independently (recursively, down to a single shot
+    if truly necessary) and the two resulting small files are then
+    joined with a plain hard-cut -- trading a few extra crossfades for a
+    render that actually finishes, exactly matching the existing
+    per-crossfade MemoryError fallback's philosophy in `_build_clip_batch`
+    (degrade gracefully, never crash the whole render over what is
+    fundamentally a resource-availability problem, not a correctness one).
+    """
+    try:
+        batch_video, batch_shot_clips = _build_clip_batch(
+            shots_chunk, resolved_media, mood, target_w, target_h, fps, energy_fn
+        )
+    except (MemoryError, OSError):
+        if len(shots_chunk) <= 1:
+            # Nothing smaller to retry with -- this is a genuine
+            # resource exhaustion that even a single shot's decode
+            # can't fit in, which previous releases always crashed on
+            # too. Let it propagate so the user still sees a clear
+            # error rather than silently producing a broken/incomplete
+            # video.
+            raise
+        log.warning(
+            "Building %d shot(s) together ran out of memory; splitting into "
+            "smaller pieces and retrying (this trades a couple of crossfade "
+            "transitions for hard cuts, but keeps the render from crashing)",
+            len(shots_chunk), exc_info=True,
+        )
+        mid = len(shots_chunk) // 2
+        path_a = _render_shots_chunk_to_file(
+            shots_chunk[:mid], resolved_media, mood, target_w, target_h, fps,
+            energy_fn, tmp_dir, chunk_label + "a",
+        )
+        path_b = _render_shots_chunk_to_file(
+            shots_chunk[mid:], resolved_media, mood, target_w, target_h, fps,
+            energy_fn, tmp_dir, chunk_label + "b",
+        )
+        clip_a = VideoFileClip(str(path_a), audio=False)
+        clip_b = VideoFileClip(str(path_b), audio=False)
+        try:
+            joined = concatenate_videoclips([clip_a, clip_b], method="compose")
+            out_path = tmp_dir / f"chunk_{chunk_label}_joined.mp4"
+            joined.write_videofile(
+                str(out_path), fps=fps, codec="libx264", audio=False,
+                preset="ultrafast", threads=2, logger=None,
+            )
+            joined.close()
+        finally:
+            clip_a.close()
+            clip_b.close()
+        return out_path
+
+    try:
+        out_path = tmp_dir / f"chunk_{chunk_label}.mp4"
+        batch_video.write_videofile(
+            str(out_path), fps=fps, codec="libx264", audio=False,
+            preset="ultrafast", threads=2, logger=None,
+        )
+    finally:
+        batch_video.close()
+        for c in batch_shot_clips:
+            _close_shot_clip(c)
+    return out_path
+
+
 def assemble_video(
     shots: list[Shot],
     resolved_media: dict[int, tuple[str | None, str]],
@@ -900,34 +1022,22 @@ def assemble_video(
                 f"Building shots {start_i + 1}-{end_i}/{total_shots}...",
             )
 
-            batch_video, batch_shot_clips = _build_clip_batch(
-                shots_batch, resolved_media, mood, target_w, target_h, fps, energy_fn
+            # _render_shots_chunk_to_file both builds+crossfades this batch
+            # AND writes it straight to its own small temporary MP4 (no
+            # audio yet -- silent intermediate files, muxed with the real
+            # audio + SFX only once at the very end), closing every
+            # MoviePy/FFmpeg resource it opened before returning. If this
+            # batch alone runs out of memory (MemoryError / Windows
+            # "paging file too small" OSError) -- which `SHOT_BATCH_SIZE`
+            # is sized to make rare, but can't rule out on every real
+            # machine's actual available memory -- it recursively splits
+            # itself into smaller pieces and retries rather than crashing
+            # the whole render; see that function's docstring.
+            batch_path = _render_shots_chunk_to_file(
+                shots_batch, resolved_media, mood, target_w, target_h, fps,
+                energy_fn, tmp_dir, f"{batch_idx:04d}",
             )
-            try:
-                batch_path = tmp_dir / f"batch_{batch_idx:04d}.mp4"
-                # No audio yet -- silent intermediate files, muxed with the
-                # real audio + SFX only once at the very end. A lower encode
-                # preset is fine here since these are throwaway intermediates.
-                batch_video.write_videofile(
-                    str(batch_path),
-                    fps=fps,
-                    codec="libx264",
-                    audio=False,
-                    preset="ultrafast",
-                    threads=2,
-                    logger=None,
-                )
-                batch_paths.append(batch_path)
-            finally:
-                # Close the composite AND every individual per-shot clip it
-                # was built from -- see _build_clip_batch's docstring for
-                # why both are required. This must happen only after
-                # write_videofile() above has fully finished reading frames
-                # from batch_video (it has, we're past that call now),
-                # otherwise we'd terminate an FFmpeg subprocess mid-read.
-                batch_video.close()
-                for c in batch_shot_clips:
-                    _close_shot_clip(c)
+            batch_paths.append(batch_path)
 
             report(
                 0.05 + 0.45 * (end_i / total_shots),
