@@ -216,35 +216,62 @@ def make_ken_burns_frame_fn(
 # ---------------------------------------------------------------------------
 
 _SAR_RE = re.compile(r"\bSAR\s+(\d+):(\d+)\b")
+_SIZE_RE = re.compile(r"\b(\d{2,5})x(\d{2,5})\b")
+
+# How much headroom to decode above the final render resolution before
+# cover_resize_crop does its own resize+crop. 1.6x covers typical
+# aspect-ratio mismatches (e.g. a 1:1 or 4:3 source cropped to 16:9)
+# without needing the full native resolution of a real phone/camera
+# recording, which is very often far larger than any render target this
+# app supports (max 4k == 2160 tall).
+_DECODE_HEADROOM = 1.6
+# Only bother requesting a smaller decode resolution from ffmpeg when the
+# source is at least this many times taller than what we'd actually
+# decode at -- avoids any downscale overhead/risk for sources that are
+# already close to the target size.
+_DECODE_DOWNSCALE_THRESHOLD = 1.2
 
 
-def _probe_pixel_aspect_ratio(video_path: str) -> float:
-    """Return the video's Sample Aspect Ratio (SAR) as a float (width_factor
-    / height_factor), or 1.0 if it can't be determined / is already square.
+def _probe_video_info(video_path: str, timeout: int = 30) -> tuple[int, int, float] | None:
+    """Probe a video file's *coded* width/height and Sample Aspect Ratio
+    (SAR) with a single `ffmpeg -i` call. Returns `(coded_w, coded_h, sar)`,
+    or `None` if the file couldn't be probed (missing binary, corrupt
+    file, or the probe itself timed out) -- callers should fall back to
+    opening the file at its native resolution with no SAR correction in
+    that case, exactly like every previous release did before this
+    function existed.
 
-    Why this exists: MoviePy 1.0.3's `FFMPEG_VideoReader` (moviepy/video/io/
-    ffmpeg_reader.py) parses only the raw *coded* pixel dimensions out of
-    ffmpeg's `Video: ... WxH ...` info line -- it never looks at SAR/DAR at
-    all. Real phone-camera video recordings are frequently encoded with
-    non-square pixels: e.g. a real test video reported coded size
-    1080x1080 but `SAR 76:135` (i.e. its *true* display size is
-    1080 * 76/135 = 608 wide x 1080 tall -- a portrait phone video, not a
-    square one). Without correcting for this, every frame MoviePy reads
-    is silently ~1.78x horizontally stretched relative to how it's meant
-    to look, before `cover_resize_crop` even runs -- verified with this
-    exact file: raw ffmpeg frame extraction with `-vf scale=608:1080`
-    (the SAR-corrected size) looks visually correct/undistorted, while
-    both direct `ffprobe`/`ffmpeg` default decode and MoviePy's
-    `VideoFileClip.get_frame()` (coded 1080x1080, no SAR applied) come
-    out stretched.
+    Why probing coded size matters (not just SAR): real phone/camera
+    video recordings -- the overwhelmingly common case for a user's own
+    "local media folder" footage, unlike pre-processed Pexels/Pixabay-
+    style stock video -- are very often shot at 4K (3840x2160) or higher,
+    while this app only ever renders at up to 1080p (and usually 720p).
+    MoviePy/FFMPEG_VideoReader decodes every frame at the source's full
+    *coded* resolution regardless of what the final render needs --
+    there is no cost-saving default. A single 4K frame is ~24MB
+    (3840*2160*3 bytes); with several such videos open at once within a
+    render batch (see SHOT_BATCH_SIZE), this was observed to exhaust
+    available memory/the Windows paging file on a real machine,
+    crashing mid-render with `MemoryError` / `OSError: [WinError 1455]
+    The paging file is too small...` -- confirmed via a real user's log
+    showing exactly these errors against their own folder of 4K Khatu
+    Shyam video clips. See `build_video_shot_clip`'s use of this probe's
+    result to request a much smaller decode resolution from ffmpeg
+    directly (via `VideoFileClip`'s `target_resolution` parameter)
+    whenever the source is meaningfully larger than needed.
 
-    We shell out to the same ffmpeg binary MoviePy itself resolves via
-    `get_setting("FFMPEG_BINARY")` (so this works identically in the
-    PyInstaller-bundled app, which vendors ffmpeg through imageio-ffmpeg,
-    not just in dev environments with a system ffmpeg) and parse the
-    `SAR W:H` token straight out of its stderr banner -- ffmpeg always
-    prints this for any input that has a non-default sample aspect ratio,
-    with no extra flags needed.
+    Why SAR is also probed here (not just coded size): MoviePy 1.0.3's
+    `FFMPEG_VideoReader` parses only the raw *coded* pixel dimensions out
+    of ffmpeg's `Video: ... WxH ...` info line -- it never looks at
+    SAR/DAR at all. Some real phone-camera recordings are encoded with
+    non-square pixels (verified case: coded 1080x1080 but `SAR 76:135`,
+    i.e. true display size 608x1080, a portrait video, not square).
+    Without correcting for this, every frame is silently stretched
+    relative to how it's meant to look. Probing both coded size and SAR
+    together in one `ffmpeg -i` call (instead of two separate probes,
+    which is what an earlier version of this code did) halves the
+    probing overhead per video and halves the chances of a slow/timed-out
+    probe for any single file.
     """
     try:
         proc = sp.run(
@@ -252,33 +279,82 @@ def _probe_pixel_aspect_ratio(video_path: str) -> float:
             stdout=sp.PIPE,
             stderr=sp.PIPE,
             stdin=sp.DEVNULL,
-            timeout=10,
+            timeout=timeout,
         )
         info = proc.stderr.decode("utf8", errors="ignore")
-        match = _SAR_RE.search(info)
-        if not match:
-            return 1.0
-        num, den = int(match.group(1)), int(match.group(2))
-        if den == 0:
-            return 1.0
-        return num / den
+
+        size_match = _SIZE_RE.search(info)
+        if not size_match:
+            return None
+        coded_w, coded_h = int(size_match.group(1)), int(size_match.group(2))
+        if coded_w <= 0 or coded_h <= 0:
+            return None
+
+        sar = 1.0
+        sar_match = _SAR_RE.search(info)
+        if sar_match:
+            num, den = int(sar_match.group(1)), int(sar_match.group(2))
+            if den != 0:
+                sar = num / den
+
+        return coded_w, coded_h, sar
     except Exception:
-        # Any probing failure (missing binary, unexpected output, timeout)
-        # should never break rendering -- fall back to "assume square
-        # pixels", which is what every previous release effectively did.
-        log.warning("Could not probe pixel aspect ratio for %s; assuming square pixels", video_path, exc_info=True)
-        return 1.0
+        # Any probing failure (missing binary, unexpected output, timeout,
+        # corrupt/unreadable file) should never break rendering -- the
+        # caller falls back to opening the file at native resolution with
+        # no SAR correction, which is what every previous release
+        # effectively did unconditionally.
+        log.warning("Could not probe video info for %s; using native resolution, assuming square pixels", video_path, exc_info=True)
+        return None
 
 
-def _correct_non_square_pixels(raw: VideoFileClip, video_path: str) -> VideoFileClip:
-    """If `raw`'s source file has a non-1:1 Sample Aspect Ratio, resize it
-    to its true display dimensions so downstream processing (cover-fit
-    crop, Ken-Burns-equivalent, color grading, etc.) operates on correctly
-    proportioned frames instead of MoviePy's raw (SAR-ignorant) coded size.
-    A no-op (returns `raw` unchanged) for the common square-pixel case, so
-    this costs nothing for ordinary video files.
+def _decode_target_resolution(coded_w: int, coded_h: int, target_w: int, target_h: int) -> tuple[int, int] | None:
+    """Decide whether to ask ffmpeg to decode `video_path` at a smaller
+    resolution than its native coded size, and if so, return the
+    `(desired_height, desired_width)` tuple to pass as `VideoFileClip`'s
+    `target_resolution` parameter (per that parameter's own documented
+    order) -- or `None` if the source is already close enough to the
+    target size that downscaling isn't worth the extra complexity.
+
+    Only `desired_height` is ever actually set (width is left `None`, so
+    `FFMPEG_VideoReader` scales width proportionally to the *coded*
+    aspect ratio on its own) -- this deliberately leaves SAR correction
+    to run as a separate step afterward on the resulting (now smaller)
+    frame, exactly as it already did before any downscaling existed, just
+    operating on fewer pixels. See `build_video_shot_clip` for how the
+    two steps compose.
     """
-    sar = _probe_pixel_aspect_ratio(video_path)
+    # The larger of the two target dimensions, with headroom for
+    # whichever orientation (landscape/portrait) the source turns out to
+    # be relative to the render target -- cover_resize_crop will scale up
+    # to fully cover (target_w, target_h) and crop the rest, so decoding
+    # at _DECODE_HEADROOM times the larger target dimension comfortably
+    # covers that regardless of the source's own aspect ratio.
+    desired_dim = int(max(target_w, target_h) * _DECODE_HEADROOM)
+    if coded_h <= desired_dim * _DECODE_DOWNSCALE_THRESHOLD and coded_w <= desired_dim * _DECODE_DOWNSCALE_THRESHOLD:
+        return None
+    # Downscale based on whichever coded dimension is larger, so a
+    # portrait source (coded_h > coded_w) and a landscape one both end up
+    # with their longer edge close to desired_dim rather than only ever
+    # constraining height.
+    if coded_h >= coded_w:
+        return desired_dim, None
+    # VideoFileClip's target_resolution is (height, width); to constrain
+    # width instead for a landscape source, compute the proportional
+    # height so FFMPEG_VideoReader's own "only one dimension given"
+    # scaling path (ratio = target / self.size[idx]) ends up constraining
+    # width to desired_dim as intended.
+    desired_height = max(1, int(round(coded_h * (desired_dim / coded_w))))
+    return desired_height, None
+
+
+def _correct_non_square_pixels_known_sar(raw: VideoFileClip, sar: float, video_path: str) -> VideoFileClip:
+    """Like the old `_correct_non_square_pixels`, but takes an
+    already-probed `sar` value instead of probing it itself -- see
+    `_probe_video_info`'s docstring for why the probe now happens once,
+    up front, shared with the decode-resolution decision, rather than a
+    second time here.
+    """
     if abs(sar - 1.0) < 1e-3:
         return raw
     coded_w, coded_h = raw.size
@@ -431,16 +507,57 @@ def build_video_shot_clip(
     responsible for closing everything in that list once it's done with
     the shot (see `_close_shot_clip`).
     """
-    raw = VideoFileClip(video_path, audio=False)
+    # Probe coded size + SAR once up front (see _probe_video_info's
+    # docstring) so we can ask ffmpeg to decode directly at a much
+    # smaller resolution when the source is far larger than this render
+    # actually needs -- e.g. a real 4K (3840x2160) phone recording being
+    # rendered into a 720p/1080p video. Without this, MoviePy decodes
+    # every frame at the source's full native resolution regardless of
+    # the render target, which is harmless for one video but was
+    # confirmed (via a real user's crash log) to exhaust memory/the
+    # Windows paging file when several such 4K sources are open within
+    # the same render batch. `probe_info` is None if probing failed for
+    # any reason (missing binary, corrupt file, timeout) -- in that case
+    # we fall back to opening at native resolution with no SAR
+    # correction, exactly like every previous release did unconditionally.
+    probe_info = _probe_video_info(video_path)
+    target_resolution = None
+    sar = 1.0
+    if probe_info is not None:
+        coded_w, coded_h, sar = probe_info
+        target_resolution = _decode_target_resolution(coded_w, coded_h, target_w, target_h)
+        if target_resolution is not None:
+            log.info(
+                "Decoding %s at reduced resolution (coded %dx%d -> target_resolution=%s) to limit memory use",
+                video_path, coded_w, coded_h, target_resolution,
+            )
+
+    try:
+        raw = VideoFileClip(video_path, audio=False, target_resolution=target_resolution)
+    except Exception:
+        if target_resolution is not None:
+            # A handful of codecs/containers don't tolerate ffmpeg's own
+            # `-vf scale=...` cleanly (observed rarely with some H.264
+            # profiles) -- retry once at native resolution rather than
+            # losing the whole shot to procedural fallback over what is
+            # purely a memory-saving optimization, not a correctness
+            # requirement.
+            log.warning(
+                "Failed to open %s at reduced resolution %s; retrying at native resolution",
+                video_path, target_resolution, exc_info=True,
+            )
+            raw = VideoFileClip(video_path, audio=False)
+        else:
+            raise
     raw_clips_to_close = [raw]
     needed = shot.duration
 
-    # Correct non-square pixels (see _correct_non_square_pixels docstring)
-    # before anything else touches frame dimensions. `raw` itself is left
-    # untouched (still tracked in raw_clips_to_close for cleanup, since it
-    # owns the underlying FFmpeg subprocess); `source` is what the rest of
-    # this function actually reads frames from.
-    source = _correct_non_square_pixels(raw, video_path)
+    # Correct non-square pixels using the SAR already probed above --
+    # `raw` itself is left untouched (still tracked in
+    # raw_clips_to_close for cleanup, since it owns the underlying
+    # FFmpeg subprocess); `source` is what the rest of this function
+    # actually reads frames from.
+    source = _correct_non_square_pixels_known_sar(raw, sar, video_path)
 
     if trim_seconds is not None:
         # Pick a random trim length within the requested range (clamped
@@ -680,8 +797,44 @@ def _build_clip_batch(
             )
 
         if len(clips) > 1:
-            faded = [clips[0]] + [c.crossfadein(CROSSFADE_DURATION) for c in clips[1:]]
-            batch_video = concatenate_videoclips(faded, method="compose", padding=-CROSSFADE_DURATION)
+            # crossfadein() reads each clip's mask, which (for the common
+            # case of a plain opaque clip) MoviePy constructs lazily via
+            # ColorClip -- i.e. an actual new per-frame numpy array
+            # allocation, not a cheap wrapper -- the very first time it's
+            # touched. This is where a 4K-video-derived clip's memory
+            # pressure (see build_video_shot_clip's probe-based
+            # downscaling, which already reduces this a lot but doesn't
+            # eliminate it entirely under severe system memory pressure)
+            # was observed to actually surface as a crash in a real user's
+            # log: every individual shot had already built successfully
+            # (several even fell back to the lightweight procedural
+            # generator after their own MemoryError, exactly as designed),
+            # but the crossfade step itself then hit the same wall with no
+            # fallback at all, taking down the entire render rather than
+            # just one shot. Guard each crossfade call individually so a
+            # transient memory failure here degrades to a hard cut for
+            # that one transition (losing a cosmetic fade, not the whole
+            # render) instead of propagating out of this function.
+            faded = [clips[0]]
+            for i, c in enumerate(clips[1:], start=1):
+                try:
+                    faded.append(c.crossfadein(CROSSFADE_DURATION))
+                except Exception:
+                    log.warning(
+                        "Crossfade transition failed for shot %d/%d in this batch (likely low memory); "
+                        "using a hard cut instead",
+                        i, len(clips), exc_info=True,
+                    )
+                    faded.append(c)
+            try:
+                batch_video = concatenate_videoclips(faded, method="compose", padding=-CROSSFADE_DURATION)
+            except Exception:
+                log.warning(
+                    "Crossfaded concatenation failed for this batch (likely low memory); "
+                    "retrying with no crossfades (hard cuts) for this batch",
+                    exc_info=True,
+                )
+                batch_video = concatenate_videoclips(clips, method="compose")
         else:
             batch_video = clips[0]
         return batch_video, clips
