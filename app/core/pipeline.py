@@ -25,6 +25,7 @@ about any of the underlying modules.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,8 +73,7 @@ def _default_output_path(audio_path: str) -> str:
 
 def _make_local_media_resolver(assets: list):
     """Build a `resolve() -> (local_path, kind)` closure that cycles
-    through ALL of `assets` (images and videos together, in the order
-    `assets` was given) round-robin.
+    through ALL of `assets` (images and videos together) round-robin.
 
     Every supplied file gets an equal turn in the rotation regardless of
     kind, so a folder containing both images and videos genuinely mixes
@@ -82,6 +82,23 @@ def _make_local_media_resolver(assets: list):
     preferred video when any was present, which silently starved out any
     supplied photos -- confirmed via a real render showing 100% video
     content; fixed by removing that partitioning entirely).
+
+    The rotation order is freshly shuffled every time this function is
+    called (i.e. once per `run_pipeline()` call -- once per generated
+    video). `scan_local_media_dir` always returns `assets` in a fixed,
+    deterministic (alphabetical) order, and the round-robin index used
+    to always start at 0 -- so every single video generated from the
+    same media folder opened with the exact same file for shot #1 and
+    then walked through the rest of the folder in the exact same
+    alphabetical sequence every time, however many different songs were
+    rendered. Confirmed via a real user's report: two different videos,
+    generated from two different songs against the same media folder,
+    both started on the identical clip. Shuffling a *copy* of `assets`
+    here (never mutating the caller's list) means a new video gets a
+    different starting clip and a different overall visitation order
+    each time, while still guaranteeing -- via the same `% len(shuffled)`
+    wraparound as before -- that every file in the folder gets an equal
+    turn within that one video's rotation.
 
     Returned `kind` is `"local_image"` / `"local_video"` so
     `video_builder.build_shot_clip` applies the extra treatment meant for
@@ -93,12 +110,15 @@ def _make_local_media_resolver(assets: list):
             return None, "procedural"
         return resolve_empty
 
+    shuffled = assets.copy()
+    random.shuffle(shuffled)
+
     index = {"i": 0}
 
     def resolve() -> tuple[str | None, str]:
-        i = index["i"] % len(assets)
+        i = index["i"] % len(shuffled)
         index["i"] += 1
-        asset = assets[i]
+        asset = shuffled[i]
         return asset.local_path, f"local_{asset.kind}"
 
     return resolve
